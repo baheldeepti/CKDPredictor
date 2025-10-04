@@ -20,6 +20,7 @@ def main():
     if missing:
         raise SystemExit(f"Missing columns in parquet: {missing}")
 
+    # Build outgoing frame with the columns we want in Postgres
     out = pd.DataFrame({
         "patient_id": df["PatientID"].astype(str),
         "Age": df["Age"],
@@ -43,6 +44,9 @@ def main():
         "AnemiaFlag": df["AnemiaFlag"],
         "Diagnosis": df["Diagnosis"],
     })
+
+    # 🔧 Critical fix: lowercase all column names to match Postgres' unquoted identifiers
+    out.columns = [c.lower() for c in out.columns]
 
     engine = create_engine(DATABASE_URL)
     out.to_sql("health_metrics", engine, if_exists="append", index=False)
