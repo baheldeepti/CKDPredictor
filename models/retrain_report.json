@@ -1,0 +1,21 @@
+{
+  "models": {
+    "xgb": {
+      "threshold": 0.08987201690673827,
+      "ap_class0": 0.30300517307951574,
+      "auroc_class0": 0.7406113537117903
+    },
+    "rf": {
+      "threshold": 0.24906856629701915,
+      "ap_class0": 0.30594381037928253,
+      "auroc_class0": 0.7211790393013101
+    },
+    "logreg": {
+      "threshold": 0.7332766139923097,
+      "ap_class0": 0.35576123738550963,
+      "auroc_class0": 0.7504366812227075
+    }
+  },
+  "rows_labeled": 1659,
+  "rows_unlabeled_user_inputs": 3
+}
