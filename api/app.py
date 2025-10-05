@@ -129,3 +129,14 @@ def predict_batch(req: BatchPredictRequest):
     df = pd.DataFrame([r.dict() for r in req.rows])
     res = predict_core(df).to_dict(orient="records")
     return {"predictions": res}
+from fastapi import status
+
+@app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
+def admin_reload():
+    """
+    Clears the in-memory model cache so next prediction/load
+    picks up the freshly written model files.
+    """
+    global _cache
+    _cache.clear()
+    return
