@@ -5,6 +5,7 @@ import math
 import requests
 import streamlit as st
 import pandas as pd
+from typing import Dict, Any, List, Tuple
 
 # =========================
 # Branding & Config
@@ -32,10 +33,10 @@ MODEL_CHOICES = [
     ("Random Forest (rf)", "rf"),
     ("Logistic Regression (logreg)", "logreg"),
 ]
-MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}
-MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}
+MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}  # UI label -> key
+MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}  # key -> UI label
 
-# Optional LLM config (OpenAI-compatible) — used only in the "AI summary & next steps" tab
+# Optional LLM config for the “AI summary & next steps” tab
 LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")  # openai | together | openrouter | custom
 LLM_API_KEY  = st.secrets.get("LLM_API_KEY", "")
 LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
@@ -68,6 +69,7 @@ hr     { border: none; border-top:1px solid #eee; margin: 0.5rem 0 1rem; }
 .block-info { font-size:13px; color:#334155; }
 .top-chip { font-size:12px; color:var(--muted); margin-top:-6px; }
 .tooltip { font-size:12px; color:#475569; }
+pre, code { white-space: pre-wrap; }
 </style>
 """
 st.markdown(STYLE, unsafe_allow_html=True)
@@ -94,7 +96,14 @@ def sanitize_payload(d: dict) -> dict:
             v = 0.0
         if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
             v = 0.0
-        out[k] = float(v)
+        try:
+            out[k] = float(v)
+        except Exception:
+            # gender, flags, stages: coerce safely
+            try:
+                out[k] = float(int(v))
+            except Exception:
+                out[k] = 0.0
     return out
 
 def safe_json_loads(txt: str, fallback: dict = None) -> dict:
@@ -141,7 +150,16 @@ def _api_get(url: str, params: dict | None = None, timeout: int = 30):
 
 def _api_post(url: str, json_body: dict | None = None, params: dict | None = None, timeout: int = 60):
     r = requests.post(url, params=params, json=json_body, timeout=timeout)
-    r.raise_for_status()
+    # Better errors: pass-through JSON if available
+    if r.status_code >= 400:
+        try:
+            detail = r.json()
+        except Exception:
+            detail = r.text
+        # raise HTTPError but attach a stringified payload so UI can branch on it
+        e = requests.HTTPError(f"{r.status_code}: {detail}")
+        e.response = r  # keep original
+        raise e
     return r.json()
 
 def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
@@ -208,6 +226,7 @@ def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
     hyperk  = 1 if potassium >= 5.5 else 0
     anemia  = 1 if hb < 12.0 else 0
 
+    # Stage by GFR (G1=≥90, G2=60-89, G3a=45-59, G3b=30-44, G4=15-29, G5<15)
     if gfr >= 90: stage = 1
     elif gfr >= 60: stage = 2
     elif gfr >= 45: stage = 3
@@ -215,6 +234,7 @@ def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
     elif gfr >= 15: stage = 4
     else: stage = 5
 
+    # Albuminuria by ACR (A1 <30, A2 30–300, A3 >300)
     if acr < 30: alb = 1
     elif acr <= 300: alb = 2
     else: alb = 3
@@ -230,6 +250,98 @@ def sample_records_df():
         [58, 1, 170, 110, 4.6, 60, 28, 750, 135, 6.2, 10.8, 8.3, 60, 13.0, 4, 3, 1, 1, 1],
     ]
     return pd.DataFrame(rows, columns=FEATURE_COLUMNS)
+
+# =========================
+# Local fallback explainer
+# =========================
+def _safe_predict_prob(api_base: str, payload: Dict[str, Any], model_key: str) -> float:
+    """Ask backend /predict and return prob_ckd, or 0.0 if it fails."""
+    try:
+        res = _api_post(f"{api_base}/predict", json_body=payload, params={"model": model_key}, timeout=20)
+        return float(res.get("prob_ckd", 0.0))
+    except Exception:
+        return 0.0
+
+def _sensitivity_top_drivers(
+    api_base: str, base_payload: Dict[str, Any], model_key: str, probe_features: List[str], k: int = 8
+) -> List[Dict[str, float]]:
+    """
+    Fallback 'top drivers': finite-difference sensitivity.
+    For each feature f, nudge +δ and -δ and take the larger absolute change in prob.
+    """
+    base_prob = _safe_predict_prob(api_base, base_payload, model_key)
+    rows = []
+    for f in probe_features:
+        if f not in base_payload:
+            continue
+        v = float(base_payload[f])
+        # sensible per-feature small step
+        if f in ("systolicbp", "diastolicbp"): delta = 5.0
+        elif f in ("gfr",): delta = 5.0
+        elif f in ("acr",): delta = max(5.0, abs(v) * 0.05)
+        elif f in ("serumelectrolytessodium",): delta = 2.0
+        elif f in ("serumelectrolytespotassium",): delta = 0.2
+        elif f in ("hba1c",): delta = 0.2
+        elif f in ("hemoglobinlevels",): delta = 0.3
+        elif f in ("serumcreatinine",): delta = 0.2
+        elif f in ("bunlevels",): delta = 2.0
+        elif f in ("pulsepressure",): delta = 3.0
+        elif f in ("ureacreatinineratio",): delta = 1.0
+        else:
+            delta = max(0.05 * abs(v), 1.0)
+
+        up = dict(base_payload); up[f] = v + delta
+        dn = dict(base_payload); dn[f] = max(0.0, v - delta)
+        p_up = _safe_predict_prob(api_base, sanitize_payload(up), model_key)
+        p_dn = _safe_predict_prob(api_base, sanitize_payload(dn), model_key)
+
+        # pick direction with larger magnitude change
+        d_up = p_up - base_prob
+        d_dn = p_dn - base_prob
+        if abs(d_up) >= abs(d_dn):
+            signed = float(d_up)
+        else:
+            signed = float(d_dn)
+        rows.append({"feature": f, "impact": abs(signed), "signed": signed})
+
+    rows.sort(key=lambda r: r["impact"], reverse=True)
+    return rows[:k]
+
+def explain_with_fallback(api_base: str, payload: Dict[str, Any], model_key: str) -> Tuple[List[Dict[str, float]], Dict[str, Any] | None, str]:
+    """
+    Try /explain first. If it fails (500/503), return local sensitivity top drivers.
+    Returns (top_rows, raw_exp_json_or_none, mode)
+    """
+    try:
+        exp = _api_post(f"{api_base}/explain", json_body=payload, params={"model": model_key}, timeout=60)
+        top = exp.get("top") or []
+        # if server provided shap_values but no top, synthesize from shap_values
+        if not top:
+            shap_map = exp.get("shap_values", {}) or {}
+            top = sorted(
+                [{"feature": k, "impact": abs(v), "signed": float(v)} for k, v in shap_map.items()],
+                key=lambda x: x["impact"], reverse=True
+            )[:8]
+        if top:
+            return top, exp, "server_shap"
+        # if still empty, fallback locally
+        top_local = _sensitivity_top_drivers(api_base, payload, model_key, FEATURE_COLUMNS, k=8)
+        return top_local, None, "local_sensitivity"
+    except requests.HTTPError as e:
+        # Graceful fallback for explain_failed or 500s
+        try:
+            status = e.response.status_code
+            body = e.response.json() if e.response.headers.get("content-type","").startswith("application/json") else e.response.text
+        except Exception:
+            status, body = None, str(e)
+        if status in (500, 503):
+            top_local = _sensitivity_top_drivers(api_base, payload, model_key, FEATURE_COLUMNS, k=8)
+            return top_local, None, "local_sensitivity"
+        # other HTTP errors: re-raise
+        raise
+    except Exception:
+        top_local = _sensitivity_top_drivers(api_base, payload, model_key, FEATURE_COLUMNS, k=8)
+        return top_local, None, "local_sensitivity"
 
 # =========================
 # Session state
@@ -419,7 +531,9 @@ with tab_single:
 
         with col1:
             age = st.number_input("Age (years)", 0, 120, age_d, key="sp_age")
-            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_d, key="sp_gender")
+            # options [0,1]; index must be 0 or 1
+            gender_index = 1 if int(gender_d) == 1 else 0
+            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_index, key="sp_gender")
             systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d, key="sp_sbp")
             diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, dbp_d, key="sp_dbp")
             serumcreatinine = st.number_input("Serum creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1, key="sp_sc")
@@ -445,8 +559,8 @@ with tab_single:
             f"CKD stage={ckdstage}, Albuminuria category={albuminuriacat}"
         )
 
-        # FIXED: Submit button is now INSIDE the form
-        do_predict = st.form_submit_button("Predict with selected models", use_container_width=True)
+        # Submit button MUST be inside form
+        do_predict = st.form_submit_button("Predict with selected models", use_container_width=True, disabled=False, help="Runs the selected models")
 
     if do_predict:
         payload = {
@@ -482,7 +596,8 @@ with tab_single:
             except requests.HTTPError as e:
                 with cols[idx]:
                     st.error(f"{MODEL_KEYS.get(m,m)} failed")
-                    st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+                    msg = getattr(e.response, "text", str(e)) or str(e)
+                    st.code(msg, language="json")
                 _log(f"Single predict HTTP ERROR ({m}): {e}")
             except Exception as e:
                 with cols[idx]:
@@ -490,7 +605,7 @@ with tab_single:
                     st.caption(str(e))
                 _log(f"Single predict ERROR ({m}): {e}")
 
-        # Explainability per selected model
+        # Explainability per selected model (with graceful fallback)
         st.markdown("#### Why did the model think that? (Top drivers)")
         st.caption("Higher bars = stronger influence on the decision for this case.")
         ecols = st.columns(len(selected_models))
@@ -498,44 +613,39 @@ with tab_single:
             if m not in st.session_state["last_pred_results"]:
                 continue
             with ecols[idx]:
-                with st.spinner(f"{MODEL_KEYS.get(m,m)} — computing SHAP"):
-                    try:
-                        exp = _api_post(
-                            f"{st.session_state['api_url']}/explain",
-                            json_body=st.session_state["last_pred_payload"],
-                            params={"model": m},
-                            timeout=60
+                try:
+                    top, raw_exp, mode = explain_with_fallback(st.session_state["api_url"], st.session_state["last_pred_payload"], m)
+                    if top:
+                        df_top = pd.DataFrame(top)
+                        if "impact" not in df_top.columns and "signed" in df_top.columns:
+                            df_top["impact"] = df_top["signed"].abs()
+                        st.bar_chart(df_top.set_index("feature")["impact"])
+                        bullets = "\n".join(
+                            f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (Δprob={float(row.get('signed',0)):+.3f})"
+                            for row in top[:5]
                         )
-                        top = exp.get("top") or []
-                        if not top:
-                            shap_map = exp.get("shap_values", {}) or {}
-                            top = sorted(
-                                [{"feature": k, "impact": abs(v), "signed": v} for k, v in shap_map.items()],
-                                key=lambda x: x["impact"], reverse=True
-                            )[:8]
-                        if top:
-                            df_top = pd.DataFrame(top)
-                            if "impact" not in df_top.columns and "signed" in df_top.columns:
-                                df_top["impact"] = df_top["signed"].abs()
-                            st.bar_chart(df_top.set_index("feature")["impact"])
-                            bullets = "\n".join(
-                                f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (SHAP={float(row.get('signed',0)):+.3f})"
-                                for row in top[:5]
-                            )
-                            st.markdown(bullets)
+                        st.markdown(bullets)
+                        note = "Server SHAP" if mode == "server_shap" else "Local sensitivity fallback"
+                        st.caption(f"*Explainer: {note}*")
+                        if raw_exp:
                             with st.expander("Raw explanation (debug)", expanded=False):
-                                st.json(exp)
-                        else:
-                            st.info("No features available.")
-                        _log(f"Explain OK ({m}).")
-                    except requests.HTTPError as e:
-                        st.error("Explain failed")
-                        st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
-                        _log(f"Explain HTTP ERROR ({m}): {e}")
-                    except Exception as e:
-                        st.error("Explain error")
-                        st.caption(str(e))
-                        _log(f"Explain ERROR ({m}): {e}")
+                                st.json(raw_exp)
+                    else:
+                        st.info("No features available for explanation.")
+                    _log(f"Explain OK ({m}) via {mode}.")
+                except requests.HTTPError as e:
+                    # If server returns structured 'detail', present more nicely
+                    try:
+                        det = e.response.json()
+                    except Exception:
+                        det = getattr(e.response, "text", str(e))
+                    st.error("Explain failed")
+                    st.code(det, language="json")
+                    _log(f"Explain HTTP ERROR ({m}): {e}")
+                except Exception as e:
+                    st.error("Explain error")
+                    st.caption(str(e))
+                    _log(f"Explain ERROR ({m}): {e}")
 
 # =========================
 # Bulk predictions
@@ -908,8 +1018,13 @@ with tab_digital_twin:
                 st.success("Done.")
                 st.json(out)
             except requests.HTTPError as e:
-                st.error("What-if failed")
-                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+                # Friendly message when backend module is missing
+                msg = getattr(e.response, "text", str(e)) or str(e)
+                if "simulate_whatif not available" in msg or e.response.status_code == 503:
+                    st.info("What-if is currently disabled on the server. Add `api/digital_twin.py` and restart the API.")
+                else:
+                    st.error("What-if failed")
+                    st.code(msg, language="json")
             except Exception as e:
                 st.error(f"What-if error: {e}")
     with cB:
@@ -923,8 +1038,12 @@ with tab_digital_twin:
                 else:
                     st.json(out)
             except requests.HTTPError as e:
-                st.error("Grid what-if failed")
-                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+                msg = getattr(e.response, "text", str(e)) or str(e)
+                if "simulate_whatif not available" in msg or e.response.status_code == 503:
+                    st.info("Grid what-if is disabled on the server. Add `api/digital_twin.py` and restart the API.")
+                else:
+                    st.error("Grid what-if failed")
+                    st.code(msg, language="json")
             except Exception as e:
                 st.error(f"Grid what-if error: {e}")
 
@@ -967,8 +1086,12 @@ with tab_counterfactuals:
             else:
                 st.json(out)
         except requests.HTTPError as e:
-            st.error("Counterfactual failed")
-            st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+            msg = getattr(e.response, "text", str(e)) or str(e)
+            if "counterfactual not available" in msg or e.response.status_code == 503:
+                st.info("Counterfactuals are disabled on the server. Add `api/counterfactuals.py` and restart the API.")
+            else:
+                st.error("Counterfactual failed")
+                st.code(msg, language="json")
         except Exception as e:
             st.error(f"Counterfactual error: {e}")
 
@@ -1009,8 +1132,12 @@ with tab_similarity:
             else:
                 st.json(out)
         except requests.HTTPError as e:
-            st.error("Similarity failed")
-            st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+            msg = getattr(e.response, "text", str(e)) or str(e)
+            if "knn_similar not available" in msg or e.response.status_code == 503:
+                st.info("Similarity search is disabled on the server. Add `api/similarity.py` and restart the API.")
+            else:
+                st.error("Similarity failed")
+                st.code(msg, language="json")
         except Exception as e:
             st.error(f"Similarity error: {e}")
 
@@ -1069,7 +1196,11 @@ with tab_agents:
                 else:
                     st.json(out)
             except requests.HTTPError as e:
-                st.error("Agents plan failed")
-                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+                msg = getattr(e.response, "text", str(e)) or str(e)
+                if "multi_agent_plan not available" in msg or e.response.status_code == 503:
+                    st.info("Server agents are disabled. Add `api/agents.py` and restart the API.")
+                else:
+                    st.error("Agents plan failed")
+                    st.code(msg, language="json")
             except Exception as e:
                 st.error(f"Agents error: {e}")
