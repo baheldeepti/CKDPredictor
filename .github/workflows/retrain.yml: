@@ -1,0 +1,49 @@
+name: Retrain Models
+
+on:
+  schedule:
+    - cron: '15 2 * * *'   # daily at 02:15 UTC
+  workflow_dispatch:       # allow manual trigger
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push model artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Set env
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          echo "DATABASE_URL=$DATABASE_URL" >> $GITHUB_ENV
+
+      - name: Run retraining
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          python ml/99_retrain.py
+
+      - name: Commit model artifacts if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add models/*.joblib models/*_threshold.json models/retrain_report.json || true
+          if git diff --cached --quiet; then
+            echo "No model changes to commit."
+          else
+            git commit -m "Auto retrain: refresh model artifacts [skip ci]"
+            git push
+          fi
