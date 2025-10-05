@@ -5,7 +5,7 @@ import json
 import subprocess
 import traceback
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -16,23 +16,18 @@ from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Head
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Optional DB logging (safe if DATABASE_URL is unset)
+# Optional DB logging (Postgres via DATABASE_URL; otherwise SQLite fallback)
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import Engine
 
 # -----------------------------------------------------------------------------
 # App (instantiate FIRST) + CORS
 # -----------------------------------------------------------------------------
 app = FastAPI(title="CKD Predictor API", version="1.1.0")
 
-# Allow Streamlit Cloud and your Render site by default; keep "*" for simplicity during hackathon
-ALLOWED_ORIGINS = [
-    "*",
-    "https://ckdpredictor.streamlit.app",
-    "https://ckdpredictor.onrender.com",
-]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=["*"],  # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,18 +41,31 @@ def root():
 # -----------------------------------------------------------------------------
 # Configuration (paths & registry)
 # -----------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent            # .../api
+
+BASE_DIR = Path(__file__).resolve().parent           # .../api
 MODEL_DIR = Path(os.getenv("MODEL_DIR") or (BASE_DIR.parent / "models"))
 
 print(f"[boot] MODEL_DIR={MODEL_DIR.resolve()} exists={MODEL_DIR.exists()}")
 
-# If your *older* XGB model exposed proba[:,1] as P(non-CKD), set True.
+# If an older XGB model had flipped proba semantics, set True; otherwise False.
 LEGACY_XGB_FLIPPED: bool = False
 
 REGISTRY: Dict[str, Dict[str, object]] = {
-    "xgb":    {"model": MODEL_DIR / "xgb_ckd.joblib",    "thr": MODEL_DIR / "xgb_ckd_threshold.json",    "flip_probas": LEGACY_XGB_FLIPPED},
-    "rf":     {"model": MODEL_DIR / "rf_ckd.joblib",     "thr": MODEL_DIR / "rf_ckd_threshold.json",     "flip_probas": False},
-    "logreg": {"model": MODEL_DIR / "logreg_ckd.joblib", "thr": MODEL_DIR / "logreg_ckd_threshold.json", "flip_probas": False},
+    "xgb": {
+        "model": MODEL_DIR / "xgb_ckd.joblib",
+        "thr":   MODEL_DIR / "xgb_ckd_threshold.json",
+        "flip_probas": LEGACY_XGB_FLIPPED,
+    },
+    "rf": {
+        "model": MODEL_DIR / "rf_ckd.joblib",
+        "thr":   MODEL_DIR / "rf_ckd_threshold.json",
+        "flip_probas": False,
+    },
+    "logreg": {
+        "model": MODEL_DIR / "logreg_ckd.joblib",
+        "thr":   MODEL_DIR / "logreg_ckd_threshold.json",
+        "flip_probas": False,
+    },
 }
 
 FEATURE_COLS: List[str] = [
@@ -72,54 +80,144 @@ FEATURE_COLS: List[str] = [
     "bp_risk","hyperkalemiaflag","anemiaflag",
 ]
 
-# Database (optional; used for logging)
+# -----------------------------------------------------------------------------
+# Database: Postgres if DATABASE_URL set; otherwise SQLite fallback (enabled by default)
+# -----------------------------------------------------------------------------
+
 DATABASE_URL = os.getenv("DATABASE_URL")
-engine = create_engine(DATABASE_URL) if DATABASE_URL else None
-print(f"[boot] DB logging enabled={bool(engine)}")
+USE_SQLITE_FALLBACK = os.getenv("USE_SQLITE_FALLBACK", "true").lower() in ("1", "true", "yes")
+
+engine: Optional[Engine] = None
+db_backend: str = "none"      # "postgres", "sqlite", "none"
+db_connected: bool = False
+DB_IS_SQLITE: bool = False
+
+def _init_db():
+    global engine, db_backend, db_connected, DB_IS_SQLITE
+
+    if DATABASE_URL:
+        try:
+            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+            with engine.begin() as c:
+                c.execute(text("SELECT 1"))
+            db_backend = "postgres"
+            db_connected = True
+            DB_IS_SQLITE = False
+            print("[db] Connected to Postgres.")
+            _ensure_tables()
+            return
+        except Exception as e:
+            print(f"[db] Postgres connection failed: {e}")
+
+    if USE_SQLITE_FALLBACK:
+        try:
+            sqlite_path = MODEL_DIR / "inference.sqlite3"
+            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+            engine = create_engine(f"sqlite:///{sqlite_path}", future=True)
+            db_backend = "sqlite"
+            DB_IS_SQLITE = True
+            with engine.begin() as c:
+                c.execute(text("SELECT 1"))
+            db_connected = True
+            print(f"[db] Using SQLite fallback at {sqlite_path}.")
+            _ensure_tables()
+            return
+        except Exception as e:
+            print(f"[db] SQLite fallback failed: {e}")
+
+    # If we reach here, DB unavailable
+    engine = None
+    db_backend = "none"
+    db_connected = False
+    DB_IS_SQLITE = False
+    print("[db] No database connected. Metrics logging disabled.")
+
+def _ensure_tables():
+    """
+    Create tables if they don't exist.
+    Uses Postgres DDL if on Postgres; SQLite-friendly DDL if on SQLite.
+    """
+    if engine is None:
+        return
+    with engine.begin() as c:
+        if DB_IS_SQLITE:
+            # SQLite types & autoincrement semantics
+            c.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_inputs (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  age REAL, gender INTEGER,
+                  systolicbp REAL, diastolicbp REAL,
+                  serumcreatinine REAL, bunlevels REAL,
+                  gfr REAL, acr REAL,
+                  serumelectrolytessodium REAL, serumelectrolytespotassium REAL,
+                  hemoglobinlevels REAL, hba1c REAL,
+                  pulsepressure REAL, ureacreatinineratio REAL,
+                  ckdstage INTEGER, albuminuriacat INTEGER,
+                  bp_risk INTEGER, hyperkalemiaflag INTEGER, anemiaflag INTEGER
+                );
+            """))
+            c.execute(text("""
+                CREATE TABLE IF NOT EXISTS inference_log (
+                  id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                  input_id INTEGER REFERENCES user_inputs(id) ON DELETE CASCADE,
+                  model_used TEXT NOT NULL,
+                  threshold_used REAL NOT NULL,
+                  prediction INTEGER NOT NULL,
+                  prob_ckd REAL NOT NULL,
+                  prob_non_ckd REAL NOT NULL
+                );
+            """))
+            # SQLite doesn't use DESC index syntax; still fine without, data is tiny.
+        else:
+            # Postgres DDL (your original)
+            c.execute(text("""
+                CREATE TABLE IF NOT EXISTS user_inputs (
+                  id BIGSERIAL PRIMARY KEY,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  age DOUBLE PRECISION, gender INT,
+                  systolicbp DOUBLE PRECISION, diastolicbp DOUBLE PRECISION,
+                  serumcreatinine DOUBLE PRECISION, bunlevels DOUBLE PRECISION,
+                  gfr DOUBLE PRECISION, acr DOUBLE PRECISION,
+                  serumelectrolytessodium DOUBLE PRECISION, serumelectrolytespotassium DOUBLE PRECISION,
+                  hemoglobinlevels DOUBLE PRECISION, hba1c DOUBLE PRECISION,
+                  pulsepressure DOUBLE PRECISION, ureacreatinineratio DOUBLE PRECISION,
+                  ckdstage INT, albuminuriacat INT,
+                  bp_risk INT, hyperkalemiaflag INT, anemiaflag INT
+                );
+            """))
+            c.execute(text("""
+                CREATE TABLE IF NOT EXISTS inference_log (
+                  id BIGSERIAL PRIMARY KEY,
+                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                  input_id BIGINT REFERENCES user_inputs(id) ON DELETE CASCADE,
+                  model_used TEXT NOT NULL,
+                  threshold_used DOUBLE PRECISION NOT NULL,
+                  prediction INT NOT NULL,
+                  prob_ckd DOUBLE PRECISION NOT NULL,
+                  prob_non_ckd DOUBLE PRECISION NOT NULL
+                );
+            """))
+            c.execute(text("""
+                CREATE INDEX IF NOT EXISTS inference_log_created_at_idx
+                ON inference_log(created_at DESC);
+            """))
+
+_init_db()
 
 # Optional lightweight admin protection
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-def _check_admin(token: str | None):
+def _check_admin(token: Optional[str]):
     if not ADMIN_TOKEN:
         return
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 # -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
-def normalize_model_key(s: str) -> str:
-    """Accept both 'rf' and labels like 'Random Forest (rf)' coming from UI."""
-    if not s:
-        return "xgb"
-    t = s.strip().lower()
-    if t in ("xgb","rf","logreg"):
-        return t
-    if "random" in t and "forest" in t:
-        return "rf"
-    if "xgboost" in t or "(xgb)" in t:
-        return "xgb"
-    if "logistic" in t or "logreg" in t:
-        return "logreg"
-    if "(" in t and ")" in t:
-        inner = t[t.find("(")+1:t.find(")")]
-        if inner in ("xgb","rf","logreg"):
-            return inner
-    return t
-
-def _positive_class_index(model) -> int:
-    try:
-        classes = getattr(model, "classes_", None)
-        if classes is None:
-            return 1
-        classes = list(classes)
-        return classes.index(1) if 1 in classes else int(np.argmax(classes))
-    except Exception:
-        return 1
-
-# -----------------------------------------------------------------------------
 # Schemas
 # -----------------------------------------------------------------------------
+
 class PatientFeatures(BaseModel):
     age: float
     gender: int
@@ -161,7 +259,7 @@ class ExplainResponse(BaseModel):
     top: List[Dict[str, float]]     # list of {feature, impact, signed}
 
 # -----------------------------------------------------------------------------
-# Model cache & loading
+# Model cache
 # -----------------------------------------------------------------------------
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
 
@@ -176,28 +274,21 @@ def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
     thr = 0.5
     if paths["thr"].exists():
         with open(paths["thr"]) as f:
-            try:
-                thr = float(json.load(f)["threshold"])
-            except Exception:
-                # fallback tolerant parser
-                try:
-                    thr = float(pd.read_json(paths["thr"]).get("threshold", 0.5))
-                except Exception:
-                    thr = 0.5
+            thr = float(json.load(f)["threshold"])
     flip = bool(paths.get("flip_probas", False))
     return mdl, thr, flip
 
 def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
-    mk = normalize_model_key(model_key)
-    if mk not in _cache:
-        mdl, thr, flip = _load_artifacts(mk)
-        _cache[mk] = {"model": mdl, "thr": thr, "flip": flip}
-    d = _cache[mk]
+    if model_key not in _cache:
+        mdl, thr, flip = _load_artifacts(model_key)
+        _cache[model_key] = {"model": mdl, "thr": thr, "flip": flip}
+    d = _cache[model_key]
     return d["model"], d["thr"], d["flip"]
 
 # -----------------------------------------------------------------------------
 # Core prediction
 # -----------------------------------------------------------------------------
+
 def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
     for c in FEATURE_COLS:
         if c not in df.columns:
@@ -208,19 +299,15 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
     df = _validate_and_order(df)
     mdl, thr, flip = get_model_and_thr(model_key)
 
-    # Use the actual positive class index (not always column 1)
-    ci = _positive_class_index(mdl)
-    proba_pos = mdl.predict_proba(df)[:, ci]
-
+    proba1 = mdl.predict_proba(df)[:, 1]  # standard: P(CKD)
     if flip:
-        # legacy XGB: proba is Non-CKD -> flip
-        prob_non_ckd = proba_pos
-        prob_ckd = 1.0 - proba_pos
-        pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 == Non-CKD
+        prob_non_ckd = proba1
+        prob_ckd = 1.0 - proba1
+        pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 means "Non-CKD"
         prediction = np.where(pred_class0 == 1, 0, 1)
     else:
-        prob_ckd = proba_pos
-        prob_non_ckd = 1.0 - proba_pos
+        prob_ckd = proba1
+        prob_non_ckd = 1.0 - proba1
         prediction = (prob_ckd >= thr).astype(int)
 
     out = pd.DataFrame({
@@ -228,30 +315,55 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
         "prob_ckd": prob_ckd.astype(float),
         "prob_non_ckd": prob_non_ckd.astype(float),
         "threshold_used": float(thr),
-        "model_used": normalize_model_key(model_key),
+        "model_used": model_key,
     })
     return out
 
 # -----------------------------------------------------------------------------
-# DB logging helpers (no-op if DATABASE_URL is not set)
+# DB logging helpers
 # -----------------------------------------------------------------------------
+
 def _save_user_input(conn, row: dict) -> int:
-    q = text("""
-        INSERT INTO user_inputs (
-            age, gender, systolicbp, diastolicbp,
-            serumcreatinine, bunlevels, gfr, acr,
-            serumelectrolytessodium, serumelectrolytespotassium,
-            hemoglobinlevels, hba1c, pulsepressure, ureacreatinineratio,
-            ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag
-        ) VALUES (
-            :age, :gender, :systolicbp, :diastolicbp,
-            :serumcreatinine, :bunlevels, :gfr, :acr,
-            :serumelectrolytessodium, :serumelectrolytespotassium,
-            :hemoglobinlevels, :hba1c, :pulsepressure, :ureacreatinineratio,
-            :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag
-        ) RETURNING id;
-    """)
-    return conn.execute(q, row).scalar()
+    if DB_IS_SQLITE:
+        q = text("""
+            INSERT INTO user_inputs (
+                age, gender, systolicbp, diastolicbp,
+                serumcreatinine, bunlevels, gfr, acr,
+                serumelectrolytessodium, serumelectrolytespotassium,
+                hemoglobinlevels, hba1c, pulsepressure, ureacreatinineratio,
+                ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag
+            ) VALUES (
+                :age, :gender, :systolicbp, :diastolicbp,
+                :serumcreatinine, :bunlevels, :gfr, :acr,
+                :serumelectrolytessodium, :serumelectrolytespotassium,
+                :hemoglobinlevels, :hba1c, :pulsepressure, :ureacreatinineratio,
+                :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag
+            );
+        """)
+        res = conn.execute(q, row)
+        try:
+            # SQLAlchemy 2.x + sqlite
+            input_id = res.lastrowid  # type: ignore[attr-defined]
+        except Exception:
+            input_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
+        return int(input_id)
+    else:
+        q = text("""
+            INSERT INTO user_inputs (
+                age, gender, systolicbp, diastolicbp,
+                serumcreatinine, bunlevels, gfr, acr,
+                serumelectrolytessodium, serumelectrolytespotassium,
+                hemoglobinlevels, hba1c, pulsepressure, ureacreatinineratio,
+                ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag
+            ) VALUES (
+                :age, :gender, :systolicbp, :diastolicbp,
+                :serumcreatinine, :bunlevels, :gfr, :acr,
+                :serumelectrolytessodium, :serumelectrolytespotassium,
+                :hemoglobinlevels, :hba1c, :pulsepressure, :ureacreatinineratio,
+                :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag
+            ) RETURNING id;
+        """)
+        return int(conn.execute(q, row).scalar())
 
 def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: dict):
     q = text("""
@@ -271,113 +383,147 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
     })
 
 # -----------------------------------------------------------------------------
-# SHAP helpers (lazy import + hardened across versions)
+# SHAP helper (super defensive)
 # -----------------------------------------------------------------------------
-def _build_explainer(model, X: pd.DataFrame):
-    try:
-        import shap  # lazy
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SHAP not installed server-side: {e}")
 
+def _is_tree_model(model) -> bool:
     name = model.__class__.__name__.lower()
-    # Prefer TreeExplainer for tree models; explain in probability space
+    return ("forest" in name) or ("xgb" in name) or ("gradientboost" in name) or hasattr(model, "feature_importances_")
+
+def _positive_class_index(model) -> int:
     try:
-        is_tree = ("forest" in name) or ("xgb" in name) or ("gradientboost" in name) or hasattr(model, "feature_importances_")
-        if is_tree:
-            return shap.TreeExplainer(model, data=X, model_output="probability")
+        classes = getattr(model, "classes_", None)
+        if classes is None:
+            return 1
+        classes = list(classes)
+        return classes.index(1) if 1 in classes else int(np.argmax(classes))
     except Exception:
-        pass
-    # Linear models (Logistic Regression etc.)
-    try:
-        if name.startswith(("logisticregression", "sgdclassifier", "linearsvc", "linear")):
-            mask = shap.maskers.Independent(X)
-            return shap.LinearExplainer(model, mask)
-    except Exception:
-        pass
-    # Generic fallback
-    try:
-        return shap.Explainer(model, X)
-    except Exception:
-        mask = shap.maskers.Independent(X)
-        return shap.Explainer(model, mask)
-
-def _extract_shap(sv, model) -> Tuple[np.ndarray, float]:
-    v = getattr(sv, "values", None)
-    if v is None:
-        v = sv[0].values
-    vals = np.array(v)
-
-    base_raw = getattr(sv, "base_values", None)
-    if base_raw is None:
-        base_raw = 0.0
-    base_arr = np.array(base_raw)
-
-    if vals.ndim == 1:
-        vals_out = vals
-    elif vals.ndim == 2:
-        vals_out = vals[0]            # (samples, features)
-    elif vals.ndim == 3:
-        ci = _positive_class_index(model)
-        vals_out = vals[ci, 0, :]     # (classes, samples, features)
-    else:
-        vals_out = np.ravel(vals)
-
-    if base_arr.ndim == 0:
-        base = float(base_arr)
-    elif base_arr.ndim in (1, 2):
-        try:
-            ci = _positive_class_index(model)
-            base = float(base_arr[ci] if base_arr.ndim == 1 else base_arr[ci, 0])
-        except Exception:
-            base = float(np.ravel(base_arr)[0])
-    else:
-        base = float(np.ravel(base_arr)[0])
-
-    return vals_out, base
+        return 1
 
 def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
+    """
+    Compute SHAP for one row robustly across SHAP versions & model types.
+    Returns (base_value, shap_map, top_list).
+    """
+    import shap  # import here so the API can still run if shap missing at build time
+
     X = features.copy()
-    explainer = _build_explainer(model, X)
+    # Prefer model-specific explainers; avoid forcing model_output="probability" due to shape quirks
+    explainer = None
+
+    try:
+        if _is_tree_model(model):
+            explainer = shap.TreeExplainer(model)  # class-wise sometimes list, sometimes array
+    except Exception:
+        explainer = None
+
+    if explainer is None:
+        try:
+            name = model.__class__.__name__.lower()
+            if name.startswith(("logisticregression", "sgdclassifier", "linear", "linearsvc")):
+                mask = shap.maskers.Independent(X)
+                explainer = shap.LinearExplainer(model, mask)
+        except Exception:
+            explainer = None
+
+    if explainer is None:
+        try:
+            explainer = shap.Explainer(model, X)
+        except Exception:
+            mask = shap.maskers.Independent(X)
+            explainer = shap.Explainer(model, mask)
+
+    # Calculate for first row only
     sv = explainer(X.iloc[[0]])
-    vals, base = _extract_shap(sv, model)
+
+    # --- normalize SHAP values shape ---
+    v = getattr(sv, "values", None)
+    base_raw = getattr(sv, "base_values", None)
+
+    # If v is a list (per-class), choose positive class if present else last
+    chosen_class = None
+    if isinstance(v, list):
+        ci = _positive_class_index(model)
+        ci = ci if ci < len(v) else (len(v) - 1)
+        chosen_class = ci
+        v_arr = np.array(v[ci])
+        vals = v_arr[0] if v_arr.ndim == 2 else v_arr
+    else:
+        vals_np = np.array(v) if v is not None else None
+        if vals_np is None:
+            # old API: sv is sequence
+            vals_np = np.array(sv[0].values)
+        if vals_np.ndim == 1:
+            vals = vals_np
+        elif vals_np.ndim == 2:
+            # (samples, features)
+            vals = vals_np[0]
+        elif vals_np.ndim == 3:
+            # could be (classes, samples, features) OR (1,1,features)
+            first_dim = vals_np.shape[0]
+            if hasattr(model, "classes_") and first_dim == len(model.classes_):
+                ci = _positive_class_index(model)
+                ci = ci if ci < first_dim else 0
+                chosen_class = ci
+                vals = vals_np[ci, 0, :]
+            else:
+                vals = vals_np[0, 0, :]
+        else:
+            vals = np.ravel(vals_np)
+
+    # --- normalize base value shape ---
+    base: float
+    if isinstance(base_raw, list):
+        if chosen_class is not None and chosen_class < len(base_raw):
+            base = float(base_raw[chosen_class])
+        else:
+            base = float(base_raw[0])
+    else:
+        base_arr = np.array(base_raw) if base_raw is not None else np.array([0.0])
+        if base_arr.ndim == 0:
+            base = float(base_arr)
+        elif base_arr.ndim == 1:
+            if chosen_class is not None and len(base_arr) > chosen_class:
+                base = float(base_arr[chosen_class])
+            else:
+                base = float(base_arr[0])
+        elif base_arr.ndim == 2:
+            # (classes, samples) or (1, samples)
+            if chosen_class is not None and base_arr.shape[0] > chosen_class:
+                base = float(base_arr[chosen_class, 0])
+            else:
+                base = float(base_arr[0, 0])
+        else:
+            base = float(np.ravel(base_arr)[0])
 
     feat_names = list(X.columns)
-    shap_dict = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
+    shap_map = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
     top = sorted(
-        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
+        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_map.items()],
         key=lambda d: d["impact"],
         reverse=True
     )[:k]
-    return base, shap_dict, top
+    return base, shap_map, top
 
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
+
 @app.get("/health")
-def health(model: str = Query("xgb", description="xgb | rf | logreg | labels ok")):
+def health(model: str = Query("xgb", description="xgb | rf | logreg")):
     try:
-        mk = normalize_model_key(model)
-        _, thr, flip = get_model_and_thr(mk)
-
-        db_connected = False
-        if engine is not None:
-            try:
-                with engine.begin() as c:
-                    c.execute(text("SELECT 1"))
-                db_connected = True
-            except Exception:
-                db_connected = False
-
+        _, thr, flip = get_model_and_thr(model)
         return {
             "status": "ok",
-            "model": mk,
+            "model": model,
             "threshold": thr,
             "legacy_flip_probas": flip,
             "db_logging": bool(engine is not None),
-            "db_connected": db_connected,
+            "db_connected": bool(db_connected),
+            "db_backend": db_backend,
         }
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        return {"status": "error", "detail": str(e), "db_connected": bool(db_connected), "db_backend": db_backend}
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(
@@ -385,11 +531,10 @@ def predict(
     model: str = Query("xgb"),
     save: bool = Query(True, description="Save input+prediction to DB"),
 ):
-    mk = normalize_model_key(model)
     df = pd.DataFrame([item.dict()])
-    res = predict_core(df, mk).iloc[0].to_dict()
+    res = predict_core(df, model).iloc[0].to_dict()
 
-    if save and engine is not None:
+    if save and engine is not None and db_connected:
         try:
             with engine.begin() as conn:
                 input_id = _save_user_input(conn, item.dict())
@@ -405,11 +550,10 @@ def predict_batch(
     model: str = Query("xgb"),
     save: bool = Query(True, description="Save inputs+predictions to DB"),
 ):
-    mk = normalize_model_key(model)
     df = pd.DataFrame([r.dict() for r in req.rows])
-    res_rows = predict_core(df, mk).to_dict(orient="records")
+    res_rows = predict_core(df, model).to_dict(orient="records")
 
-    if save and engine is not None:
+    if save and engine is not None and db_connected:
         try:
             with engine.begin() as conn:
                 for row_in, row_out in zip(req.rows, res_rows):
@@ -421,27 +565,43 @@ def predict_batch(
     return {"predictions": res_rows}
 
 # === Explainability ==========================================================
+
 @app.post("/explain", response_model=ExplainResponse)
 def explain(
     item: PatientFeatures,
     model: str = Query("xgb"),
 ):
+    """
+    Returns SHAP explanation for a single row:
+    {
+      "base_value": float,
+      "shap_values": {"feature": signed_value, ...},
+      "top": [{"feature":"gfr","impact":0.34,"signed":-0.34}, ...]
+    }
+    """
     try:
-        mk = normalize_model_key(model)
         df_in = pd.DataFrame([item.dict()])
         X = _validate_and_order(df_in)
-        mdl, _, _ = get_model_and_thr(mk)
 
-        base, shap_values, top = _shap_top_k(X, mdl, k=6)
-        return {"base_value": base, "shap_values": shap_values, "top": top}
+        mdl, _, _ = get_model_and_thr(model)
+        base, shap_values, top = _shap_top_k(X, mdl, k=8)
+        return {
+            "base_value": base,
+            "shap_values": shap_values,
+            "top": top,
+        }
     except HTTPException:
         raise
     except Exception as e:
         print("[/explain] error:", e)
         print(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"detail": f"explain_failed: {str(e)}", "model": model})
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"explain_failed: {str(e)}", "model": model}
+        )
 
 # === Retrain / Reload =======================================================
+
 def _run_retrain_pipeline():
     try:
         subprocess.run([sys.executable, "ml/99_retrain.py"], check=True)
@@ -455,7 +615,7 @@ def _run_retrain_pipeline():
 def admin_retrain(
     background: BackgroundTasks,
     sync: bool = Query(False, description="Run synchronously (blocks request)"),
-    x_admin_token: str | None = Header(None),
+    x_admin_token: Optional[str] = Header(None),
 ):
     _check_admin(x_admin_token)
     if sync:
@@ -466,18 +626,22 @@ def admin_retrain(
         return {"status": "started", "mode": "async"}
 
 @app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
-def admin_reload(x_admin_token: str | None = Header(None)):
+def admin_reload(x_admin_token: Optional[str] = Header(None)):
     _check_admin(x_admin_token)
     global _cache
     _cache.clear()
     return  # 204 No Content
 
 # === Metrics ================================================================
+
 @app.get("/metrics/retrain_report")
 def retrain_report():
     path = MODEL_DIR / "retrain_report.json"
     if not path.exists():
-        return JSONResponse(status_code=404, content={"detail": "retrain_report.json not found"})
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "retrain_report.json not found"}
+        )
     try:
         return json.loads(path.read_text())
     except Exception as e:
@@ -485,10 +649,10 @@ def retrain_report():
 
 @app.get("/metrics/last_inferences")
 def last_inferences(limit: int = Query(10, ge=1, le=100)):
-    if engine is None:
+    if engine is None or not db_connected:
         return JSONResponse(
             status_code=503,
-            content={"detail": "DATABASE_URL not configured on server; cannot read inference_log."},
+            content={"detail": "DB not connected; cannot read inference_log."},
         )
     with engine.begin() as c:
         rows = c.execute(text("""
@@ -498,3 +662,14 @@ def last_inferences(limit: int = Query(10, ge=1, le=100)):
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
     return {"rows": [dict(r) for r in rows]}
+
+# -----------------------------------------------------------------------------
+# Entrypoint for `python -m api.app` (optional)
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    # Safe dev server — use uvicorn in prod (Render/Gunicorn)
+    import uvicorn
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    reload_flag = os.getenv("RELOAD", "false").lower() in ("1", "true", "yes")
+    uvicorn.run("api.app:app", host=host, port=port, reload=reload_flag)
