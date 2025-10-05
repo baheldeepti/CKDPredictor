@@ -247,3 +247,42 @@ def admin_reload():
     global _cache
     _cache.clear()
     return
+from fastapi.responses import JSONResponse
+
+@app.get("/metrics/retrain_report")
+def retrain_report():
+    """
+    Returns the last retraining summary if models/retrain_report.json exists.
+    """
+    path = Path("models/retrain_report.json")
+    if not path.exists():
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "retrain_report.json not found. Run ml/99_retrain.py or wait for CI retrain."},
+        )
+    try:
+        data = json.loads(path.read_text())
+        return data
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"failed to read report: {e}"})
+
+
+@app.get("/metrics/last_inferences")
+def last_inferences(limit: int = Query(10, ge=1, le=100)):
+    """
+    Returns the most recent inference rows (joined with nothing else for privacy),
+    requires DATABASE_URL to be set.
+    """
+    if engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "DATABASE_URL not configured on server; cannot read inference_log."},
+        )
+    with engine.begin() as c:
+        rows = c.execute(text("""
+            SELECT il.created_at, il.model_used, il.prediction, il.prob_ckd, il.prob_non_ckd, il.threshold_used
+            FROM inference_log il
+            ORDER BY il.created_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+    return {"rows": [dict(r) for r in rows]}
