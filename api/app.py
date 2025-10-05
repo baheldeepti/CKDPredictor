@@ -13,17 +13,45 @@ import shap
 from joblib import load
 
 from pydantic import BaseModel, Field, ConfigDict
-from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Header
+from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Header, Body
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+# === New modules you added ====================================================
+# These imports assume your files are at:
+#   api/agents.py          -> multi_agent_plan
+#   api/digital_twin.py    -> simulate_whatif
+#   api/counterfactuals.py -> counterfactual
+#   api/similarity.py      -> knn_similar
+#
+# If your filenames differ, just adjust these import paths accordingly.
+try:
+    from api.agents import multi_agent_plan
+except Exception:
+    multi_agent_plan = None
+
+try:
+    from api.digital_twin import simulate_whatif
+except Exception:
+    simulate_whatif = None
+
+try:
+    from api.counterfactuals import counterfactual
+except Exception:
+    counterfactual = None
+
+try:
+    from api.similarity import knn_similar
+except Exception:
+    knn_similar = None
+
 # -----------------------------------------------------------------------------
 # App + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="1.0.0")
+app = FastAPI(title="CKD Predictor API", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -200,6 +228,19 @@ class ExplainResponse(BaseModel):
     shap_values: Dict[str, float]
     top: List[Dict[str, float]]
 
+# (Optional) What-If + Counterfactual request schemas (if your modules accept structured inputs)
+class WhatIfRequest(BaseModel):
+    base: PatientFeatures
+    deltas: Dict[str, float] | None = None
+    model: str = "xgb"
+    grid: Dict[str, List[float]] | None = None
+
+class CFRequest(BaseModel):
+    base: PatientFeatures
+    target_prob: float = Field(0.2, ge=0.0, le=1.0)
+    model: str = "xgb"
+    method: str = "auto"  # "auto" | "greedy" | "dice" etc.
+
 # -----------------------------------------------------------------------------
 # Model cache
 # -----------------------------------------------------------------------------
@@ -322,12 +363,8 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
 # -----------------------------------------------------------------------------
 # SHAP utils (bulletproof for RF / XGB / LogReg)
 # -----------------------------------------------------------------------------
-
 def _pos_index(model) -> int:
-    """
-    Index of the positive class (prefer label 1 when present, else largest label).
-    Works for sklearn classifiers.
-    """
+    """Index of the positive class (prefer label 1)."""
     try:
         classes = getattr(model, "classes_", None)
         if classes is None:
@@ -344,9 +381,7 @@ def _pos_index(model) -> int:
     except Exception:
         return 1
 
-
 def _to_1d_float(vec) -> np.ndarray:
-    """Coerce anything to a 1D float vector."""
     arr = np.asarray(vec)
     if arr.ndim == 0:
         arr = arr.reshape(1)
@@ -354,34 +389,23 @@ def _to_1d_float(vec) -> np.ndarray:
         arr = arr.reshape(-1)
     return arr.astype(float, copy=False)
 
-
 def _to_scalar_float(x, prefer_index: int | None = None) -> float:
-    """
-    Coerce SHAP expected_value/base_values into a single float, picking the
-    preferred class index if a vector is given; otherwise the first element.
-    """
     arr = np.asarray(x)
     if arr.size == 0:
         return 0.0
     if arr.ndim == 0:
         return float(arr)
-    # 1D or more; pick class index if given, else first
     idx = 0 if prefer_index is None else min(max(prefer_index, 0), arr.shape[0] - 1)
     try:
         return float(arr.reshape(-1)[idx])
     except Exception:
         return float(np.ravel(arr)[0])
 
-
 def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
-    """
-    Compute SHAP values for the first row, for the *positive* class.
-    Returns (vals_for_row_1D_float, base_value_float).
-    Handles old/new SHAP APIs and varying output shapes.
-    """
+    """Compute SHAP values for the positive class for the first row."""
     pos = _pos_index(model)
 
-    # 1) Tree-based models (RF/XGB) using classic API; prefer probability space
+    # Tree-based (RF/XGB)
     try:
         try:
             tree_expl = shap.TreeExplainer(model, model_output="probability")
@@ -389,47 +413,36 @@ def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
             tree_expl = shap.TreeExplainer(model)
         if hasattr(tree_expl, "shap_values"):
             sv = tree_expl.shap_values(X)
-            # sv may be a list (per-class) or an array
             if isinstance(sv, list):
-                # If SHAP returns only one array, use it; otherwise pick pos
                 idx = 0 if len(sv) == 1 else min(pos, len(sv) - 1)
                 arr = np.asarray(sv[idx])
             else:
                 arr = np.asarray(sv)
-
-            # arr shapes seen in the wild:
-            # (n_samples, n_features), (n_features,), (classes, n_samples, n_features),
-            # (n_samples, classes, n_features)
             if arr.ndim == 3:
-                # try (classes, samples, features)
                 if arr.shape[0] in (1, 2) and arr.shape[1] >= 1:
                     vals = arr[min(pos, arr.shape[0] - 1), 0, :]
-                # try (samples, classes, features)
                 elif arr.shape[1] in (1, 2) and arr.shape[0] >= 1:
                     vals = arr[0, min(pos, arr.shape[1] - 1), :]
                 else:
                     vals = arr.reshape(-1)[0: X.shape[1]]
             elif arr.ndim == 2:
-                # (n_samples, n_features) -> first sample
                 vals = arr[0]
             elif arr.ndim == 1:
-                # (n_features,)
                 vals = arr
             else:
                 vals = arr.reshape(-1)[0: X.shape[1]]
 
             base = getattr(tree_expl, "expected_value", 0.0)
-            # expected_value may be scalar or per-class vector
             base_val = _to_scalar_float(base, prefer_index=None if np.asarray(base).size == 1 else pos)
             return _to_1d_float(vals), base_val
     except Exception:
         pass
 
-    # 2) Linear models (LogReg) classic API
+    # Linear (LogReg)
     try:
         lin_expl = shap.LinearExplainer(model, X, feature_dependence="independent")
         if hasattr(lin_expl, "shap_values"):
-            arr = np.asarray(lin_expl.shap_values(X))  # (n_samples, n_features) or (n_features,)
+            arr = np.asarray(lin_expl.shap_values(X))
             vals = arr[0] if arr.ndim == 2 else arr
             base = getattr(lin_expl, "expected_value", 0.0)
             base_val = _to_scalar_float(base, prefer_index=None if np.asarray(base).size == 1 else pos)
@@ -437,21 +450,19 @@ def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
     except Exception:
         pass
 
-    # 3) New unified Explanation API
+    # Unified API
     try:
         exp = shap.Explainer(model, X)
         res = exp(X.iloc[[0]])
         v = getattr(res, "values", None)
         b = getattr(res, "base_values", 0.0)
-
-        if isinstance(v, list):  # per-class list
+        if isinstance(v, list):
             idx = 0 if len(v) == 1 else min(pos, len(v) - 1)
             arr = np.asarray(v[idx])
             vals = arr[0] if arr.ndim >= 2 else arr
         else:
             arr = np.asarray(v)
             if arr.ndim == 3:
-                # (classes, samples, features) or (samples, classes, features)
                 if arr.shape[0] in (1, 2) and arr.shape[1] >= 1:
                     vals = arr[min(pos, arr.shape[0] - 1), 0, :]
                 elif arr.shape[1] in (1, 2) and arr.shape[0] >= 1:
@@ -464,13 +475,12 @@ def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
                 vals = arr
             else:
                 vals = arr.reshape(-1)[0: X.shape[1]]
-
         base_val = _to_scalar_float(b, prefer_index=None if np.asarray(b).size == 1 else pos)
         return _to_1d_float(vals), base_val
     except Exception:
         pass
 
-    # 4) Fallback to importances / coefficients (keeps UI alive)
+    # Fallback
     try:
         if hasattr(model, "feature_importances_"):
             vals = _to_1d_float(getattr(model, "feature_importances_"))
@@ -483,12 +493,10 @@ def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
 
     raise RuntimeError("Could not compute SHAP values for this model/version.")
 
-
 def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     X = features.copy()
     vals, base = _compute_shap_binary(model, X)
     feat_names = list(X.columns)
-    # Align defensively
     n = min(len(feat_names), vals.size)
     vals = vals[:n]
     shap_dict = {feat_names[i]: float(vals[i]) for i in range(n)}
@@ -499,7 +507,7 @@ def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     return float(base), shap_dict, top
 
 # -----------------------------------------------------------------------------
-# Endpoints
+# Endpoints — Core
 # -----------------------------------------------------------------------------
 @app.get("/health")
 def health(model: str = Query("xgb", description="xgb | rf | logreg")):
@@ -556,8 +564,10 @@ def predict_batch(
 
     return {"predictions": res_rows}
 
-# === Explainability ==========================================================
-@app.post("/explain")
+# -----------------------------------------------------------------------------
+# Explainability
+# -----------------------------------------------------------------------------
+@app.post("/explain", response_model=ExplainResponse)
 def explain(item: PatientFeatures, model: str = Query("xgb")):
     """
     Returns SHAP explanation for a single row, as JSON:
@@ -591,7 +601,78 @@ def explain(item: PatientFeatures, model: str = Query("xgb")):
             content={"detail": f"explain_failed: {str(e)}", "model": model}
         )
 
-# === Retrain / Reload ========================================================
+# -----------------------------------------------------------------------------
+# Digital Twin / What-If
+# -----------------------------------------------------------------------------
+@app.post("/whatif")
+def whatif_api(req: WhatIfRequest):
+    """
+    Run a single what-if or a grid sweep:
+    body: { base: PatientFeatures, deltas: {...}, model: "xgb", grid: { "systolicbp":[120,130,140], ... } }
+    """
+    try:
+        if simulate_whatif is None:
+            return JSONResponse(status_code=503, content={"detail": "simulate_whatif not available"})
+        return simulate_whatif(req)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"whatif_failed: {e}"})
+
+# -----------------------------------------------------------------------------
+# Counterfactuals
+# -----------------------------------------------------------------------------
+@app.post("/counterfactual")
+def counterfactual_api(req: CFRequest):
+    """
+    Find actionable changes to reduce risk below a target (greedy or DiCE).
+    body: { base: PatientFeatures, target_prob: 0.2, model: "xgb", method: "auto" }
+    """
+    try:
+        if counterfactual is None:
+            return JSONResponse(status_code=503, content={"detail": "counterfactual not available"})
+        return counterfactual(req)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"counterfactual_failed: {e}"})
+
+# -----------------------------------------------------------------------------
+# Patient Similarity / Nearest Neighbors
+# -----------------------------------------------------------------------------
+@app.post("/similar")
+def similar_api(
+    base: dict = Body(..., description="Baseline PatientFeatures"),
+    cohort: list[dict] = Body(default=[], description="List of PatientFeatures to search in"),
+    k: int = Query(5, ge=1, le=50),
+):
+    """
+    Returns top-k similar rows (euclidean). For production, back this with a DB query.
+    """
+    try:
+        if knn_similar is None:
+            return JSONResponse(status_code=503, content={"detail": "knn_similar not available"})
+        return knn_similar(base, cohort, k=k)
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"similar_failed: {e}"})
+
+# -----------------------------------------------------------------------------
+# Multi-Agent Care Plan
+# -----------------------------------------------------------------------------
+@app.post("/agents/plan")
+def agents_plan_api(summary: dict = Body(...)):
+    """
+    LLM-powered care plan from a dict summary {metrics, flags, stage, etc}.
+    """
+    try:
+        if multi_agent_plan is None:
+            return JSONResponse(status_code=503, content={"detail": "multi_agent_plan not available"})
+        out = multi_agent_plan(summary)
+        if isinstance(out, dict) and "error" in out:
+            return JSONResponse(status_code=503, content=out)
+        return out
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"agents_failed: {e}"})
+
+# -----------------------------------------------------------------------------
+# Retrain / Reload
+# -----------------------------------------------------------------------------
 def _run_retrain_pipeline():
     try:
         subprocess.run([sys.executable, "ml/99_retrain.py"], check=True)
@@ -622,7 +703,9 @@ def admin_reload(x_admin_token: str | None = Header(None)):
     _cache.clear()
     return  # 204
 
-# === Metrics ================================================================
+# -----------------------------------------------------------------------------
+# Metrics
+# -----------------------------------------------------------------------------
 @app.get("/metrics/retrain_report")
 def retrain_report():
     path = MODEL_DIR / "retrain_report.json"
