@@ -1,7 +1,10 @@
 # api/app.py
 import os
+import re
 import sys
 import json
+import math
+import random
 import subprocess
 import traceback
 from pathlib import Path
@@ -23,7 +26,7 @@ from sqlalchemy import create_engine, text
 # -----------------------------------------------------------------------------
 # App (instantiate FIRST) + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="0.9.1")
+app = FastAPI(title="CKD Predictor API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -51,22 +54,23 @@ print(f"[boot] MODEL_DIR={MODEL_DIR.resolve()} exists={MODEL_DIR.exists()}")
 # If using models from ml/99_retrain.py (standard class1=CKD), keep False.
 LEGACY_XGB_FLIPPED: bool = False
 
-REGISTRY: Dict[str, Dict[str, object]] = {
-    "xgb": {
-        "model": MODEL_DIR / "xgb_ckd.joblib",
-        "thr": MODEL_DIR / "xgb_ckd_threshold.json",
-        "flip_probas": LEGACY_XGB_FLIPPED,
-    },
-    "rf": {
-        "model": MODEL_DIR / "rf_ckd.joblib",
-        "thr": MODEL_DIR / "rf_ckd_threshold.json",
-        "flip_probas": False,
-    },
-    "logreg": {
-        "model": MODEL_DIR / "logreg_ckd.joblib",
-        "thr": MODEL_DIR / "logreg_ckd_threshold.json",
-        "flip_probas": False,
-    },
+# Environment overrides are allowed, e.g. RF_MODEL_PATH, LOGREG_MODEL_PATH, XGB_MODEL_PATH
+ENV_MODEL_PATHS = {
+    "rf": os.getenv("RF_MODEL_PATH"),
+    "logreg": os.getenv("LOGREG_MODEL_PATH"),
+    "xgb": os.getenv("XGB_MODEL_PATH"),
+}
+ENV_THR_PATHS = {
+    "rf": os.getenv("RF_THR_PATH"),
+    "logreg": os.getenv("LOGREG_THR_PATH"),
+    "xgb": os.getenv("XGB_THR_PATH"),
+}
+
+# Default expected filenames (we'll also search for near-matches)
+DEFAULT_FILES = {
+    "xgb": ("xgb_ckd.joblib", "xgb_ckd_threshold.json"),
+    "rf": ("rf_ckd.joblib", "rf_ckd_threshold.json"),
+    "logreg": ("logreg_ckd.joblib", "logreg_ckd_threshold.json"),
 }
 
 FEATURE_COLS: List[str] = [
@@ -92,6 +96,74 @@ def _check_admin(token: str | None):
         return
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+# -----------------------------------------------------------------------------
+# Utility: model key normalization & artifact discovery
+# -----------------------------------------------------------------------------
+
+ALIASES = {
+    "rf": "rf",
+    "random forest": "rf",
+    "random_forest": "rf",
+    "randomforest": "rf",
+    "forest": "rf",
+    "logreg": "logreg",
+    "logistic regression": "logreg",
+    "logistic": "logreg",
+    "lr": "logreg",
+    "xgb": "xgb",
+    "xgboost": "xgb",
+}
+
+def _normalize_model_key(s: str) -> str:
+    t = s.strip().lower()
+    t = re.sub(r"[\s\-_()]+", " ", t).strip()
+    # try direct
+    if t in ALIASES: return ALIASES[t]
+    # token-based
+    if "forest" in t or "rf" in t: return "rf"
+    if "xgb" in t or "xgboost" in t: return "xgb"
+    if "log" in t: return "logreg"
+    return t  # maybe already exact
+
+def _search_first(models_dir: Path, pat: str) -> Path | None:
+    # find first file matching pattern (case-insensitive)
+    pat_low = pat.lower()
+    for p in models_dir.glob("*.joblib"):
+        if pat_low in p.name.lower():
+            return p
+    return None
+
+def _artifact_paths(kind: str) -> Tuple[Path, Path, bool]:
+    """
+    Return (model_path, threshold_path, flip_probas) for key 'rf'|'logreg'|'xgb'.
+    Uses env overrides, else defaults, else best-effort search in MODEL_DIR.
+    """
+    if kind not in ("rf", "logreg", "xgb"):
+        raise HTTPException(status_code=400, detail=f"Unknown model '{kind}'. Use one of ['rf','logreg','xgb'].")
+
+    env_model = ENV_MODEL_PATHS.get(kind)
+    env_thr = ENV_THR_PATHS.get(kind)
+
+    if env_model:
+        mpath = Path(env_model)
+    else:
+        default_name, default_thr = DEFAULT_FILES[kind]
+        mpath = MODEL_DIR / default_name
+        if not mpath.exists():
+            # try fuzzy search: e.g., "*rf*ckd*.joblib"
+            guess = _search_first(MODEL_DIR, kind+"_") or _search_first(MODEL_DIR, kind) or _search_first(MODEL_DIR, "ckd")
+            if guess:
+                mpath = guess
+
+    if env_thr:
+        tpath = Path(env_thr)
+    else:
+        default_name, default_thr = DEFAULT_FILES[kind]
+        tpath = MODEL_DIR / default_thr
+
+    flip = (LEGACY_XGB_FLIPPED if kind == "xgb" else False)
+    return mpath, tpath, flip
 
 # -----------------------------------------------------------------------------
 # Schemas
@@ -143,25 +215,30 @@ class ExplainResponse(BaseModel):
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
 
 def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
-    mk = model_key.lower()
-    if mk not in REGISTRY:
-        raise HTTPException(status_code=400, detail=f"Unknown model '{model_key}'. Use one of {list(REGISTRY)}")
-    paths = REGISTRY[mk]
-    if not paths["model"].exists():
-        raise HTTPException(status_code=400, detail=f"Model file missing for '{mk}'. Train it first.")
-    mdl = load(paths["model"])
+    mk = _normalize_model_key(model_key)
+    mpath, tpath, flip = _artifact_paths(mk)
+
+    if not mpath.exists():
+        raise HTTPException(status_code=400, detail=f"Model file not found for '{mk}'. Looked at: {mpath}")
+
+    mdl = load(mpath)
+
     thr = 0.5
-    if paths["thr"].exists():
-        with open(paths["thr"]) as f:
-            thr = float(json.load(f)["threshold"])
-    flip = bool(paths.get("flip_probas", False))
+    if tpath.exists():
+        try:
+            with open(tpath) as f:
+                thr = float(json.load(f).get("threshold", 0.5))
+        except Exception:
+            thr = 0.5
+
     return mdl, thr, flip
 
 def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
-    if model_key not in _cache:
-        mdl, thr, flip = _load_artifacts(model_key)
-        _cache[model_key] = {"model": mdl, "thr": thr, "flip": flip}
-    d = _cache[model_key]
+    mk = _normalize_model_key(model_key)
+    if mk not in _cache:
+        mdl, thr, flip = _load_artifacts(mk)
+        _cache[mk] = {"model": mdl, "thr": thr, "flip": flip}
+    d = _cache[mk]
     return d["model"], d["thr"], d["flip"]
 
 # -----------------------------------------------------------------------------
@@ -194,7 +271,7 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
         "prob_ckd": prob_ckd.astype(float),
         "prob_non_ckd": prob_non_ckd.astype(float),
         "threshold_used": float(thr),
-        "model_used": model_key,
+        "model_used": _normalize_model_key(model_key),
     })
     return out
 
@@ -238,32 +315,55 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
     })
 
 # -----------------------------------------------------------------------------
-# SHAP helper (hardened for RF + LogReg + XGB)
+# SHAP helpers (hardened for RF + LogReg + XGB)
 # -----------------------------------------------------------------------------
 
 def _positive_class_index(model) -> int:
     try:
         classes = getattr(model, "classes_", None)
-        if classes is None:
-            return 1
+        if classes is None: return 1
         classes = list(classes)
-        return classes.index(1) if 1 in classes else (np.argmax(classes))
+        return classes.index(1) if 1 in classes else int(np.argmax(classes))
     except Exception:
         return 1
+
+def _build_background(row_df: pd.DataFrame, n: int = 40) -> pd.DataFrame:
+    """
+    Create a small jittered background around the single row to avoid zero SHAP with
+    degenerate background. This is for explanation only (hackathon-friendly).
+    """
+    rng = np.random.default_rng(42)
+    row = row_df.iloc[0].copy()
+    bg = []
+    for _ in range(n):
+        pert = {}
+        for f in FEATURE_COLS:
+            v = float(row[f])
+            # 10% relative jitter (bounded), fallback to small absolute jitter
+            scale = max(abs(v) * 0.10, 1.0)
+            pert_val = v + rng.normal(0, scale)
+            pert[f] = pert_val
+        # clamp plausible ranges for ints / flags
+        pert["gender"] = int(round(np.clip(pert["gender"], 0, 1)))
+        pert["bp_risk"] = int(round(np.clip(pert["bp_risk"], 0, 3)))
+        pert["hyperkalemiaflag"] = int(round(np.clip(pert["hyperkalemiaflag"], 0, 1)))
+        pert["anemiaflag"] = int(round(np.clip(pert["anemiaflag"], 0, 1)))
+        pert["ckdstage"] = int(round(np.clip(pert["ckdstage"], 0, 5)))
+        pert["albuminuriacat"] = int(round(np.clip(pert["albuminuriacat"], 0, 3)))
+        bg.append(pert)
+    df_bg = pd.DataFrame(bg)[FEATURE_COLS]
+    return df_bg
 
 def _extract_shap_values(sv, model) -> Tuple[np.ndarray, float]:
     """
     Robustly extract (values_for_positive_class, base_value) from a shap.Explanation
     across SHAP versions and model types.
     """
-    # values may be array, list of arrays, or a 3D (classes, samples, features)
     v = getattr(sv, "values", None)
     if v is None:
-        # Older API: sv is array-like
         v = sv[0].values
     vals = np.array(v)
 
-    # base values
     base_raw = getattr(sv, "base_values", None)
     if base_raw is None:
         base_raw = 0.0
@@ -272,27 +372,23 @@ def _extract_shap_values(sv, model) -> Tuple[np.ndarray, float]:
     if vals.ndim == 1:
         vals_out = vals
     elif vals.ndim == 2:
-        # (samples, features)
         vals_out = vals[0]
     elif vals.ndim == 3:
-        # (classes, samples, features)
         ci = _positive_class_index(model)
         vals_out = vals[ci, 0, :]
     else:
         raise ValueError(f"Unexpected SHAP values shape: {vals.shape}")
 
-    # base handling: pick positive class if classwise, else first
+    # base handling
     if base_arr.ndim == 0:
         base = float(base_arr)
     elif base_arr.ndim == 1:
-        # could be (samples,) or (classes,)
         if len(base_arr) == 2 and hasattr(model, "classes_"):
             ci = _positive_class_index(model)
             base = float(base_arr[ci])
         else:
             base = float(base_arr[0])
     elif base_arr.ndim == 2:
-        # (classes, samples)
         ci = _positive_class_index(model)
         base = float(base_arr[ci, 0])
     else:
@@ -300,47 +396,85 @@ def _extract_shap_values(sv, model) -> Tuple[np.ndarray, float]:
 
     return vals_out, base
 
+def _proba_fn(model):
+    ci = _positive_class_index(model)
+    def f(Xnp: np.ndarray) -> np.ndarray:
+        df = pd.DataFrame(Xnp, columns=FEATURE_COLS)
+        p = model.predict_proba(df)
+        return p[:, ci]
+    return f
+
 def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     """
-    Build a robust SHAP explainer, compute values for the first row.
-    Works for tree (XGB/RF) and linear (logreg). Falls back to generic Explainer.
+    Build a robust SHAP explainer for a single row.
+    1) Try Tree/Linear explainers
+    2) Fallback to model-agnostic Permutation/Kernel with a jittered background
     Returns (base_value, dict{feature->value}, top_list[{feature, impact, signed}]).
     """
     X = features.copy()
+    assert X.shape[0] == 1, "expect single-row dataframe"
 
-    # Choose explainer
+    # Try specialized explainers
     explainer = None
     try:
-        # Tree models: RandomForest*, XGB*, GradientBoost*
         name = model.__class__.__name__.lower()
         is_tree = ("forest" in name) or ("xgb" in name) or ("gradientboost" in name) or hasattr(model, "feature_importances_")
         if is_tree:
-            # Use probability space for classifiers to avoid log-odds confusion
-            explainer = shap.TreeExplainer(model, data=X, model_output="probability")
+            explainer = shap.TreeExplainer(model, model_output="probability")
     except Exception:
         explainer = None
 
     if explainer is None:
         try:
-            # Linear models (LogisticRegression/SGD/Linear*)
             name = model.__class__.__name__.lower()
             if name.startswith(("logisticregression", "sgdclassifier", "linearsvc", "linear")):
-                mask = shap.maskers.Independent(X)
+                mask = shap.maskers.Independent(_build_background(X, n=50))
                 explainer = shap.LinearExplainer(model, mask)
         except Exception:
             explainer = None
 
-    # Generic fallback
-    if explainer is None:
+    # Compute with specialized explainer if we have one
+    if explainer is not None:
         try:
-            explainer = shap.Explainer(model, X)
+            sv = explainer(X)
+            vals, base = _extract_shap_values(sv, model)
+            if np.all(np.isfinite(vals)) and not np.allclose(vals, 0, atol=1e-10):
+                feat_names = list(X.columns)
+                shap_dict = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
+                top = sorted(
+                    [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
+                    key=lambda d: d["impact"],
+                    reverse=True
+                )[:k]
+                return base, shap_dict, top
         except Exception:
-            mask = shap.maskers.Independent(X)
-            explainer = shap.Explainer(model, mask)
+            pass  # fall through to model-agnostic path
 
-    sv = explainer(X.iloc[[0]])
+    # Model-agnostic fallback (works for pipelines too)
+    bg = _build_background(X, n=50)
+    f = _proba_fn(model)
+
+    # Prefer PermutationExplainer if available; else KernelExplainer
+    try:
+        expl = shap.explainers.Permutation(f, bg)
+        sv = expl(X)
+    except Exception:
+        expl = shap.KernelExplainer(f, bg)
+        sv = expl.shap_values(X, nsamples=100)
+        # KernelExplainer returns array, not Explanation
+        vals = np.array(sv)[0] if isinstance(sv, list) else np.array(sv)[0]
+        base = float(expl.expected_value) if np.isscalar(expl.expected_value) else float(np.array(expl.expected_value)[0])
+        feat_names = list(X.columns)
+        shap_dict = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
+        top = sorted(
+            [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
+            key=lambda d: d["impact"],
+            reverse=True
+        )[:k]
+        return base, shap_dict, top
+
+    # PermutationExplainer path
     vals, base = _extract_shap_values(sv, model)
-
     feat_names = list(X.columns)
     shap_dict = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
     top = sorted(
@@ -354,19 +488,38 @@ def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
 # Endpoints
 # -----------------------------------------------------------------------------
 
+@app.get("/models")
+def models():
+    """
+    Report which model artifacts are detected.
+    """
+    out = {}
+    for mk in ("rf", "logreg", "xgb"):
+        mpath, tpath, flip = _artifact_paths(mk)
+        out[mk] = {
+            "model_path": str(mpath.resolve()),
+            "model_exists": mpath.exists(),
+            "threshold_path": str(tpath.resolve()),
+            "threshold_exists": tpath.exists(),
+            "legacy_flip_probas": flip,
+        }
+    return out
+
 @app.get("/health")
-def health(model: str = Query("xgb", description="xgb | rf | logreg")):
+def health(model: str = Query("xgb", description="xgb | rf | logreg (aliases accepted)")):
     try:
-        _, thr, flip = get_model_and_thr(model)
+        mdl, thr, flip = get_model_and_thr(model)
         return {
             "status": "ok",
-            "model": model,
+            "model": _normalize_model_key(model),
             "threshold": thr,
             "legacy_flip_probas": flip,
             "db_logging": bool(engine is not None),
         }
+    except HTTPException as he:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": he.detail})
     except Exception as e:
-        return {"status": "error", "detail": str(e)}
+        return JSONResponse(status_code=500, content={"status": "error", "detail": str(e)})
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(
@@ -383,6 +536,7 @@ def predict(
                 input_id = _save_user_input(conn, item.dict())
                 _save_inference(conn, input_id, res["model_used"], res["threshold_used"], res)
         except Exception as e:
+            # don't break inference if logging fails
             print(f"[warn] logging failed: {e}")
 
     return res
@@ -409,42 +563,33 @@ def predict_batch(
 
 # === Explainability ==========================================================
 
-@app.post("/explain")
+@app.post("/explain", response_model=ExplainResponse)
 def explain(
     item: PatientFeatures,
     model: str = Query("xgb"),
 ):
     """
-    Returns SHAP explanation for a single row, as JSON:
-    {
-      "base_value": float,
-      "shap_values": {"feature": signed_value, ...},
-      "top": [{"feature":"gfr","impact":0.34,"signed":-0.34}, ...]
-    }
+    SHAP explanation for a single row (robust across RF / LogReg / XGB).
     """
     try:
         df_in = pd.DataFrame([item.dict()])
-        for c in FEATURE_COLS:
-            if c not in df_in.columns:
-                raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
-        X = df_in[FEATURE_COLS].copy()
-
+        X = _validate_and_order(df_in)
         mdl, _, _ = get_model_and_thr(model)
+
         base, shap_values, top = _shap_top_k(X, mdl, k=6)
         return {
-            "base_value": base,
+            "base_value": float(base),
             "shap_values": shap_values,
             "top": top,
         }
     except HTTPException:
         raise
     except Exception as e:
-        # Logs full traceback server-side; short message to client
         print("[/explain] error:", e)
         print(traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={"detail": f"explain_failed: {str(e)}", "model": model}
+            content={"detail": f"explain_failed: {str(e)}", "model": _normalize_model_key(model)}
         )
 
 # === Retrain / Reload =======================================================
