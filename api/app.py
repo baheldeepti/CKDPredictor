@@ -3,11 +3,13 @@ import os
 import sys
 import json
 import subprocess
+import traceback
 from pathlib import Path
 from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import shap
 from joblib import load
 from pydantic import BaseModel, Field
 
@@ -19,9 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
 # -----------------------------------------------------------------------------
-# App (instantiate first) + CORS
+# App (instantiate FIRST) + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="0.7.0")
+app = FastAPI(title="CKD Predictor API", version="0.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,7 +78,6 @@ engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 # Optional lightweight admin protection (set ADMIN_TOKEN env var to enable)
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 
-
 def _check_admin(token: str | None):
     if not ADMIN_TOKEN:
         return  # no protection configured
@@ -108,7 +109,6 @@ class PatientFeatures(BaseModel):
     hyperkalemiaflag: int
     anemiaflag: int
 
-
 class PredictResponse(BaseModel):
     prediction: int = Field(description="0 = Non-CKD, 1 = CKD")
     prob_ckd: float
@@ -116,14 +116,11 @@ class PredictResponse(BaseModel):
     threshold_used: float
     model_used: str
 
-
 class BatchPredictRequest(BaseModel):
     rows: List[PatientFeatures]
 
-
 class BatchPredictResponse(BaseModel):
     predictions: List[PredictResponse]
-
 
 class ExplainResponse(BaseModel):
     base_value: float
@@ -134,7 +131,6 @@ class ExplainResponse(BaseModel):
 # Model cache
 # -----------------------------------------------------------------------------
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
-
 
 def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
     mk = model_key.lower()
@@ -150,7 +146,6 @@ def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
             thr = float(json.load(f)["threshold"])
     flip = bool(paths.get("flip_probas", False))
     return mdl, thr, flip
-
 
 def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
     if model_key not in _cache:
@@ -168,7 +163,6 @@ def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
         if c not in df.columns:
             raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
     return df[FEATURE_COLS].copy()
-
 
 def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
     df = _validate_and_order(df)
@@ -217,7 +211,6 @@ def _save_user_input(conn, row: dict) -> int:
     """)
     return conn.execute(q, row).scalar()
 
-
 def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: dict):
     q = text("""
         INSERT INTO inference_log (
@@ -236,6 +229,66 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
     })
 
 # -----------------------------------------------------------------------------
+# SHAP helper (robust)
+# -----------------------------------------------------------------------------
+
+def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
+    """
+    Build a robust SHAP explainer, compute values for the first row.
+    Works for tree (XGB/RF) and linear (logreg). Falls back to generic Explainer.
+    Returns (base_value, dict{feature->value}, top_list[{feature, impact, signed}]).
+    """
+    X = features.copy()
+
+    # Try specialized explainers first for stability & speed
+    explainer = None
+    try:
+        # XGB / RF (tree-based)
+        from xgboost import XGBClassifier  # noqa: F401
+        is_tree = (
+            hasattr(model, "feature_importances_")
+            or model.__class__.__name__.lower().startswith(("xgb", "randomforest", "gradientboost"))
+        )
+        if is_tree:
+            explainer = shap.TreeExplainer(model, feature_names=X.columns.tolist())
+    except Exception:
+        explainer = None
+
+    if explainer is None:
+        try:
+            # Linear models (logreg, etc.)
+            from sklearn.linear_model import LogisticRegression  # noqa: F401
+            if model.__class__.__name__.lower().startswith(("logisticregression", "sgdclassifier", "linearsvc")):
+                mask = shap.maskers.Independent(X)
+                explainer = shap.LinearExplainer(model, mask)
+        except Exception:
+            explainer = None
+
+    # Generic fallback
+    if explainer is None:
+        try:
+            explainer = shap.Explainer(model, X, feature_names=X.columns.tolist())
+        except Exception:
+            # Last resort: independent masker + generic
+            mask = shap.maskers.Independent(X)
+            explainer = shap.Explainer(model, mask)
+
+    # Compute SHAP values for the first row only (what the UI needs)
+    sv = explainer(X.iloc[[0]])
+    # sv.values shape: (1, n_features); sv.base_values shape: (1,) or scalar
+    vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
+    base = float(sv.base_values[0] if getattr(sv, "base_values", None) is not None else 0.0)
+
+    feat_names = list(X.columns)
+    shap_dict = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
+    top = sorted(
+        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
+        key=lambda d: d["impact"],
+        reverse=True
+    )[:k]
+    return base, shap_dict, top
+
+# -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
 
@@ -252,7 +305,6 @@ def health(model: str = Query("xgb", description="xgb | rf | logreg")):
         }
     except Exception as e:
         return {"status": "error", "detail": str(e)}
-
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(
@@ -273,7 +325,6 @@ def predict(
             print(f"[warn] logging failed: {e}")
 
     return res
-
 
 @app.post("/predict/batch", response_model=BatchPredictResponse)
 def predict_batch(
@@ -297,56 +348,46 @@ def predict_batch(
 
 # === Explainability ==========================================================
 
-@app.post("/explain", response_model=ExplainResponse)
+@app.post("/explain")
 def explain(
     item: PatientFeatures,
     model: str = Query("xgb"),
 ):
     """
-    SHAP explanation for a single row.
-    Returns base_value, per-feature signed shap values, and top features by |impact|.
+    Returns SHAP explanation for a single row, as JSON:
+    {
+      "base_value": float,
+      "shap_values": {"feature": signed_value, ...},
+      "top": [{"feature":"gfr","impact":0.34,"signed":-0.34}, ...]
+    }
     """
     try:
-        import shap  # uses shap.Explainer which auto-picks model type (tree/linear/kernel)
+        # Build single-row DataFrame in correct column order
+        df_in = pd.DataFrame([item.dict()])
+        for c in FEATURE_COLS:
+            if c not in df_in.columns:
+                raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
+        X = df_in[FEATURE_COLS].copy()
+
+        mdl, _, _ = get_model_and_thr(model)
+
+        # SHAP
+        base, shap_values, top = _shap_top_k(X, mdl, k=6)
+        return {
+            "base_value": base,
+            "shap_values": shap_values,
+            "top": top,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"SHAP not available: {e}")
-
-    df = pd.DataFrame([item.dict()])
-    df = _validate_and_order(df)
-    mdl, _, _ = get_model_and_thr(model)
-
-    try:
-        explainer = shap.Explainer(mdl)     # works for tree/linear/sklearn pipelines
-        sv = explainer(df)                  # shap.Explanation
-        base = float(np.array(sv.base_values)[0])
-        vals = np.array(sv.values)[0]       # per-feature shap values
-    except Exception as e:
-        # fallback: TreeExplainer for tree models
-        try:
-            explainer = shap.TreeExplainer(mdl)
-            sv = explainer.shap_values(df)
-            # For binary classification, shap_values may be list [class0, class1]; take class1
-            if isinstance(sv, list) and len(sv) == 2:
-                vals = np.array(sv[1][0])
-            else:
-                vals = np.array(sv[0])
-            ev = getattr(explainer, "expected_value", 0.0)
-            base = float(ev[1] if isinstance(ev, (list, tuple)) and len(ev) > 1 else ev)
-        except Exception as ee:
-            raise HTTPException(status_code=500, detail=f"Failed to compute SHAP values: {e}; fallback error: {ee}")
-
-    shap_map = {feat: float(v) for feat, v in zip(FEATURE_COLS, vals)}
-    top_sorted = sorted(
-        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_map.items()],
-        key=lambda x: x["impact"],
-        reverse=True
-    )[:8]
-
-    return {
-        "base_value": base,
-        "shap_values": shap_map,
-        "top": top_sorted,
-    }
+        # Print full traceback to the API log; return brief error to client
+        print("[/explain] error:", e)
+        print(traceback.format_exc())
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"explain_failed: {str(e)}"}
+        )
 
 # === Retrain / Reload =======================================================
 
@@ -365,7 +406,6 @@ def _run_retrain_pipeline():
     except subprocess.CalledProcessError as e:
         print(f"[retrain] failed: {e}")
 
-
 @app.post("/admin/retrain")
 def admin_retrain(
     background: BackgroundTasks,
@@ -375,6 +415,7 @@ def admin_retrain(
     """
     Kicks off retraining. By default runs in the background and returns immediately.
     Use sync=true to block until finished (not recommended for UI).
+    If ADMIN_TOKEN env is set, pass header: X-Admin-Token: <token>
     """
     _check_admin(x_admin_token)
     if sync:
@@ -384,12 +425,12 @@ def admin_retrain(
         background.add_task(_run_retrain_pipeline)
         return {"status": "started", "mode": "async"}
 
-
 @app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
 def admin_reload(x_admin_token: str | None = Header(None)):
     """
     Clears the in-memory model cache so the next call reloads fresh artifacts.
     Use this after CI retraining updates files in ./models.
+    If ADMIN_TOKEN env is set, pass header: X-Admin-Token: <token>
     """
     _check_admin(x_admin_token)
     global _cache
