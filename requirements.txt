@@ -1,17 +1,41 @@
+# ---- Core data stack
 pandas==2.2.2
 numpy==1.26.4
 pyarrow==16.1.0
-SQLAlchemy==2.0.32
-psycopg2-binary==2.9.9
+
+# ---- ML / Explainability
 scikit-learn==1.5.1
 xgboost==2.1.1
 joblib==1.4.2
-fastapi==0.115.0
-uvicorn[standard]==0.30.6
-pydantic==2.9.2
-streamlit==1.38.0
-requests==2.32.3
-shap>=0.45,<1.0
-matplotlib==3.9.2
+shap>=0.45,<1.0        # Works well with numpy 1.26 + numba 0.60
 numba==0.60.0
-altair>=5.4.1      # Streamlit built-in charts rely on it; keeps bar charts happy
+matplotlib==3.9.2
+
+# ---- API backend
+fastapi==0.115.0
+pydantic==2.9.2
+uvicorn[standard]==0.30.6
+orjson==3.10.7         # (optional) faster JSON for FastAPI responses
+
+# ---- DB layer
+SQLAlchemy==2.0.32
+psycopg2-binary==2.9.9
+
+# ---- Frontend
+streamlit==1.38.0
+altair>=5.4.1          # Streamlit charts need recent Altair
+
+# ---- Networking
+requests==2.32.3
+httpx==0.27.2          # (optional) modern async client if you need it
+
+# ---- LLM / Agents (open-source friendly)
+openai>=1.40.0         # Works with OpenAI-compatible endpoints (OpenRouter/vLLM/Together/Groq)
+crewai>=0.51.0
+langgraph>=0.2.30
+
+# ---- Counterfactuals / What-if
+dice-ml>=0.11.0
+
+# ---- Utilities
+python-dotenv>=1.0.1   # Load LLM_BASE_URL, LLM_MODEL, DB creds, etc.
