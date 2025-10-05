@@ -1,4 +1,4 @@
-o# api/app.py
+# api/app.py
 import os
 import sys
 import json
