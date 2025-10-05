@@ -446,7 +446,7 @@ with tab_single:
         )
 
         # FIXED: Submit button is now INSIDE the form
-        do_predict = st.form_submit_button("Predict with selected models", key="sp_predict")
+        do_predict = st.form_submit_button("Predict with selected models", use_container_width=True)
 
     if do_predict:
         payload = {
