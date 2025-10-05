@@ -80,7 +80,7 @@ FEATURE_COLS: List[str] = [
 ]
 
 # -----------------------------------------------------------------------------
-# Import optional modules (fail loud with reason)
+# Import optional modules (with captured errors for diagnostics)
 # -----------------------------------------------------------------------------
 def _import_or_error() -> Dict[str, Any]:
     mods: Dict[str, Any] = {"errors": {}}
@@ -552,6 +552,19 @@ def health(model: str = Query("xgb", description="xgb | rf | logreg")):
         }
     except Exception as e:
         return {"status": "error", "detail": str(e), "db_connected": bool(_db_ok)}
+
+@app.get("/ready")
+def ready():
+    """
+    Simple readiness/feature probe so the UI can decide which advanced tabs to surface.
+    """
+    return {
+        "agents": {"loaded": multi_agent_plan is not None, "error": _import_errors.get("agents")},
+        "whatif": {"loaded": simulate_whatif is not None, "error": _import_errors.get("digital_twin")},
+        "counterfactual": {"loaded": counterfactual is not None, "error": _import_errors.get("counterfactuals")},
+        "similar": {"loaded": knn_similar is not None, "error": _import_errors.get("similarity")},
+        "db": {"connected": bool(_db_ok), "backend": _db_backend()},
+    }
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(
