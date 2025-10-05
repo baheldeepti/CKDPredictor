@@ -322,25 +322,28 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
 # -----------------------------------------------------------------------------
 # SHAP utils (bulletproof for RF / XGB / LogReg)
 # -----------------------------------------------------------------------------
+
 def _pos_index(model) -> int:
-    """Return index of the positive class. Prefer label 1; else last/largest."""
+    """
+    Index of the positive class (prefer label 1 when present, else largest label).
+    Works for sklearn classifiers.
+    """
     try:
         classes = getattr(model, "classes_", None)
         if classes is None:
             return 1
         arr = np.array(list(classes))
-        # If numeric
         if np.issubdtype(arr.dtype, np.number):
             if (arr == 1).any():
                 return int(np.where(arr == 1)[0][0])
-            return int(np.argmax(arr))  # pick largest label
-        # Non-numeric labels (e.g., ["Non-CKD","CKD"])
+            return int(np.argmax(arr))
         labels = [str(x) for x in arr.tolist()]
         if "1" in labels:
             return labels.index("1")
-        return len(labels) - 1  # choose last as "positive"
+        return len(labels) - 1
     except Exception:
         return 1
+
 
 def _to_1d_float(vec) -> np.ndarray:
     """Coerce anything to a 1D float vector."""
@@ -351,85 +354,123 @@ def _to_1d_float(vec) -> np.ndarray:
         arr = arr.reshape(-1)
     return arr.astype(float, copy=False)
 
+
 def _to_scalar_float(x, prefer_index: int | None = None) -> float:
-    """Coerce SHAP expected_value/base_values into a single float."""
+    """
+    Coerce SHAP expected_value/base_values into a single float, picking the
+    preferred class index if a vector is given; otherwise the first element.
+    """
     arr = np.asarray(x)
     if arr.size == 0:
         return 0.0
     if arr.ndim == 0:
         return float(arr)
-    idx = 0 if prefer_index is None else min(prefer_index, arr.shape[0] - 1)
+    # 1D or more; pick class index if given, else first
+    idx = 0 if prefer_index is None else min(max(prefer_index, 0), arr.shape[0] - 1)
     try:
         return float(arr.reshape(-1)[idx])
     except Exception:
         return float(np.ravel(arr)[0])
 
+
 def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
     """
-    Compute SHAP values for the first row, positive class.
+    Compute SHAP values for the first row, for the *positive* class.
     Returns (vals_for_row_1D_float, base_value_float).
+    Handles old/new SHAP APIs and varying output shapes.
     """
     pos = _pos_index(model)
 
-    # 1) Tree-based path (RF/XGB) – classic API
+    # 1) Tree-based models (RF/XGB) using classic API; prefer probability space
     try:
-        tree_expl = shap.TreeExplainer(model)
+        try:
+            tree_expl = shap.TreeExplainer(model, model_output="probability")
+        except TypeError:
+            tree_expl = shap.TreeExplainer(model)
         if hasattr(tree_expl, "shap_values"):
             sv = tree_expl.shap_values(X)
+            # sv may be a list (per-class) or an array
             if isinstance(sv, list):
-                arr = np.asarray(sv[min(pos, len(sv) - 1)])
-                vals = arr[0]                       # (n_features,)
+                # If SHAP returns only one array, use it; otherwise pick pos
+                idx = 0 if len(sv) == 1 else min(pos, len(sv) - 1)
+                arr = np.asarray(sv[idx])
             else:
                 arr = np.asarray(sv)
-                vals = arr[0] if arr.ndim >= 2 else arr
+
+            # arr shapes seen in the wild:
+            # (n_samples, n_features), (n_features,), (classes, n_samples, n_features),
+            # (n_samples, classes, n_features)
+            if arr.ndim == 3:
+                # try (classes, samples, features)
+                if arr.shape[0] in (1, 2) and arr.shape[1] >= 1:
+                    vals = arr[min(pos, arr.shape[0] - 1), 0, :]
+                # try (samples, classes, features)
+                elif arr.shape[1] in (1, 2) and arr.shape[0] >= 1:
+                    vals = arr[0, min(pos, arr.shape[1] - 1), :]
+                else:
+                    vals = arr.reshape(-1)[0: X.shape[1]]
+            elif arr.ndim == 2:
+                # (n_samples, n_features) -> first sample
+                vals = arr[0]
+            elif arr.ndim == 1:
+                # (n_features,)
+                vals = arr
+            else:
+                vals = arr.reshape(-1)[0: X.shape[1]]
+
             base = getattr(tree_expl, "expected_value", 0.0)
-            base_val = _to_scalar_float(base, prefer_index=pos)
-            vals = _to_1d_float(vals)
-            return vals, base_val
+            # expected_value may be scalar or per-class vector
+            base_val = _to_scalar_float(base, prefer_index=None if np.asarray(base).size == 1 else pos)
+            return _to_1d_float(vals), base_val
     except Exception:
         pass
 
-    # 2) Linear path (LogReg) – classic API
+    # 2) Linear models (LogReg) classic API
     try:
         lin_expl = shap.LinearExplainer(model, X, feature_dependence="independent")
         if hasattr(lin_expl, "shap_values"):
-            arr = np.asarray(lin_expl.shap_values(X))  # (n_samples, n_features)
-            vals = arr[0]
+            arr = np.asarray(lin_expl.shap_values(X))  # (n_samples, n_features) or (n_features,)
+            vals = arr[0] if arr.ndim == 2 else arr
             base = getattr(lin_expl, "expected_value", 0.0)
-            base_val = _to_scalar_float(base, prefer_index=pos)
-            vals = _to_1d_float(vals)
-            return vals, base_val
+            base_val = _to_scalar_float(base, prefer_index=None if np.asarray(base).size == 1 else pos)
+            return _to_1d_float(vals), base_val
     except Exception:
         pass
 
-    # 3) New Explanation API
+    # 3) New unified Explanation API
     try:
         exp = shap.Explainer(model, X)
         res = exp(X.iloc[[0]])
         v = getattr(res, "values", None)
         b = getattr(res, "base_values", 0.0)
 
-        if isinstance(v, list):               # list per class
-            arr = np.asarray(v[min(pos, len(v) - 1)])
+        if isinstance(v, list):  # per-class list
+            idx = 0 if len(v) == 1 else min(pos, len(v) - 1)
+            arr = np.asarray(v[idx])
             vals = arr[0] if arr.ndim >= 2 else arr
         else:
             arr = np.asarray(v)
-            if arr.ndim == 3:                 # (classes, samples, features)
-                vals = arr[min(pos, arr.shape[0] - 1), 0, :]
-            elif arr.ndim == 2:               # (samples, features)
+            if arr.ndim == 3:
+                # (classes, samples, features) or (samples, classes, features)
+                if arr.shape[0] in (1, 2) and arr.shape[1] >= 1:
+                    vals = arr[min(pos, arr.shape[0] - 1), 0, :]
+                elif arr.shape[1] in (1, 2) and arr.shape[0] >= 1:
+                    vals = arr[0, min(pos, arr.shape[1] - 1), :]
+                else:
+                    vals = arr.reshape(-1)[0: X.shape[1]]
+            elif arr.ndim == 2:
                 vals = arr[0]
-            elif arr.ndim == 1:               # (features,)
+            elif arr.ndim == 1:
                 vals = arr
             else:
-                vals = arr.reshape(-1)
+                vals = arr.reshape(-1)[0: X.shape[1]]
 
-        base_val = _to_scalar_float(b, prefer_index=pos)
-        vals = _to_1d_float(vals)
-        return vals, base_val
+        base_val = _to_scalar_float(b, prefer_index=None if np.asarray(b).size == 1 else pos)
+        return _to_1d_float(vals), base_val
     except Exception:
         pass
 
-    # 4) Fallback – feature_importances_/coef_ (keeps UI alive)
+    # 4) Fallback to importances / coefficients (keeps UI alive)
     try:
         if hasattr(model, "feature_importances_"):
             vals = _to_1d_float(getattr(model, "feature_importances_"))
@@ -442,20 +483,18 @@ def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
 
     raise RuntimeError("Could not compute SHAP values for this model/version.")
 
+
 def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     X = features.copy()
     vals, base = _compute_shap_binary(model, X)
     feat_names = list(X.columns)
-
-    # Align length defensively
+    # Align defensively
     n = min(len(feat_names), vals.size)
     vals = vals[:n]
-
     shap_dict = {feat_names[i]: float(vals[i]) for i in range(n)}
     top = sorted(
         [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
-        key=lambda d: d["impact"],
-        reverse=True
+        key=lambda d: d["impact"], reverse=True
     )[:k]
     return float(base), shap_dict, top
 
