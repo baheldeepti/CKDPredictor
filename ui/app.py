@@ -24,10 +24,10 @@ MODEL_CHOICES = [
 ]
 
 # Optional LLM config (OpenAI-compatible)
-LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openai")   # openai | together | openrouter | custom
+LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")   # openai | together | openrouter | custom
 LLM_API_KEY   = st.secrets.get("LLM_API_KEY", "")
-LLM_BASE_URL  = st.secrets.get("LLM_BASE_URL", "")        # e.g., "https://api.openai.com/v1" or provider gateway
-LLM_MODEL     = st.secrets.get("LLM_MODEL", "gpt-4o-mini")  # or an OSS model name provided by your gateway
+LLM_BASE_URL  = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")  # default to OpenRouter
+LLM_MODEL     = st.secrets.get("LLM_MODEL", "openrouter/auto")  # or any model your gateway supports
 
 st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
 
@@ -58,13 +58,11 @@ def call_llm(system_prompt: str, user_prompt: str):
     if not LLM_API_KEY:
         st.warning("No LLM API key configured. Add LLM_API_KEY (and optionally LLM_BASE_URL, LLM_MODEL) in `.streamlit/secrets.toml`.")
         return None
-
     try:
         from openai import OpenAI
     except Exception:
         st.error("Package `openai` missing. Install with: `pip install openai`")
         return None
-
     try:
         client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
         resp = client.chat.completions.create(
@@ -85,7 +83,6 @@ def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
     hyperk = 1 if potassium >= 5.5 else 0
     anemia = 1 if hb < 12.0 else 0
 
-    # CKD stage from GFR (coarse)
     if gfr >= 90: stage = 1
     elif gfr >= 60: stage = 2
     elif gfr >= 45: stage = 3
@@ -99,7 +96,19 @@ def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
 
     return bp_risk, hyperk, anemia, stage, alb
 
-# Keep last prediction for the Recommendations tab
+def sample_records_df():
+    # 5 realistic synthetic rows matching the schema
+    rows = [
+        # age, gender, sys, dia, creat, bun, gfr, acr, Na, K, Hgb, HbA1c, PP, U/C, stage, alb, BP, HK, anemia
+        [65, 1, 148, 86, 2.1, 32, 52, 120, 139, 4.8, 12.2, 6.5, 62, 15.2, 2, 2, 1, 0, 0],
+        [54, 0, 132, 82, 1.6, 28, 65, 35, 141, 4.3, 13.5, 6.1, 50, 17.5, 2, 2, 1, 0, 0],
+        [72, 1, 160, 95, 3.4, 48, 38, 420, 137, 5.7, 11.2, 7.8, 65, 12.5, 3, 3, 1, 1, 1],
+        [43, 0, 118, 74, 0.9, 18, 92, 10, 142, 3.9, 13.9, 5.2, 44, 20.0, 1, 1, 0, 0, 0],
+        [58, 1, 170, 110, 4.6, 60, 28, 750, 135, 6.2, 10.8, 8.3, 60, 13.0, 4, 3, 1, 1, 1],
+    ]
+    return pd.DataFrame(rows, columns=FEATURE_COLUMNS)
+
+# Keep last single-case prediction for the Recommendations tab
 if "last_pred_payload" not in st.session_state:
     st.session_state["last_pred_payload"] = None
 if "last_pred_result" not in st.session_state:
@@ -107,7 +116,7 @@ if "last_pred_result" not in st.session_state:
 
 # ===== Header =================================================================
 st.title("🩺 CKD Predictor")
-st.caption("Single & batch predictions with thresholding, metrics, and AI recommendations.")
+st.caption("Single & batch predictions with thresholding, metrics, retraining, and AI recommendations.")
 
 # ===== Sidebar Controls ========================================================
 with st.sidebar:
@@ -151,7 +160,7 @@ tab_single, tab_batch, tab_metrics, tab_advice = st.tabs(
 # ---- Single prediction --------------------------------------------------------
 with tab_single:
     st.markdown("**Use this tab to score a single case.** Fill the form and click **Predict**. "
-                "Optionally tick **Retrain after submit** to kick off server-side retraining right away.")
+                "Optionally tick **Retrain after submit** to kick off server-side retraining.")
 
     with st.form("predict_form", border=True):
         col1, col2 = st.columns(2)
@@ -206,11 +215,9 @@ with tab_single:
             label = "CKD" if res.get("prediction", 1) == 1 else "Non-CKD"
             _result_card(label, float(res.get("prob_ckd", 0.0)), float(res.get("threshold_used", 0.5)), res.get("model_used", "unknown"))
 
-            # Save to session for the Recommendations tab
             st.session_state["last_pred_payload"] = payload
             st.session_state["last_pred_result"] = res
 
-            # Optional retrain (no form button here; we respect the checkbox)
             if retrain_after:
                 try:
                     rr = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
@@ -223,14 +230,27 @@ with tab_single:
 
 # ---- Batch predictions -------------------------------------------------------
 with tab_batch:
-    st.markdown("**Use this tab to score a file of cases.** Download the template, fill it, upload, then click **Run Batch Predictions**.")
+    st.markdown("**Use this tab to score a file of cases.** Download a blank template or a 5-row sample, upload, then click **Run Batch Predictions**.")
 
-    template = pd.DataFrame(columns=FEATURE_COLUMNS)
-    st.download_button("Download Template CSV", data=template.to_csv(index=False).encode("utf-8"),
-                       file_name="ckd_template.csv", mime="text/csv")
+    template_blank = pd.DataFrame(columns=FEATURE_COLUMNS)
+    sample5 = sample_records_df()
+
+    cta = st.columns(2)
+    with cta[0]:
+        st.download_button("Download Blank Template CSV",
+            data=template_blank.to_csv(index=False).encode("utf-8"),
+            file_name="ckd_template_blank.csv", mime="text/csv")
+    with cta[1]:
+        st.download_button("Download Sample CSV (5 rows)",
+            data=sample5.to_csv(index=False).encode("utf-8"),
+            file_name="ckd_sample_5rows.csv", mime="text/csv")
+
     st.code(",".join(FEATURE_COLUMNS), language="text")
 
     file = st.file_uploader("Upload CSV", type=["csv"])
+    retrain_after_batch = st.checkbox("Retrain after batch", value=False)
+
+    batch_preds_df = None
     if file:
         try:
             df = pd.read_csv(file)
@@ -239,6 +259,7 @@ with tab_batch:
                 st.error(f"Missing columns: {missing}")
             else:
                 st.dataframe(df.head())
+
                 if st.button("Run Batch Predictions"):
                     rows = df.to_dict(orient="records")
                     r = requests.post(
@@ -261,6 +282,44 @@ with tab_batch:
                         file_name="ckd_batch_predictions.csv",
                         mime="text/csv"
                     )
+
+                    batch_preds_df = preds
+
+                    if retrain_after_batch:
+                        try:
+                            rr = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
+                            st.success("Retraining started. Use Health in the sidebar to check when updated.")
+                        except Exception as e:
+                            st.error(f"Retrain call failed: {e}")
+
+                # Cohort insights via LLM (optional)
+                if batch_preds_df is not None and not batch_preds_df.empty:
+                    with st.expander("Generate cohort insights (AI)"):
+                        if st.button("Summarize cohort"):
+                            pos_rate = batch_preds_df["prediction"].mean()
+                            avg_prob = batch_preds_df.get("prob_ckd", pd.Series([0])).mean()
+                            system_prompt = (
+                                "You are a cautious, clinical assistant creating cohort insights for CKD screening.\n"
+                                "Do not give medication dosing. Provide red flags, diet/exercise high-level guidance,\n"
+                                "and a follow-up checklist. Add 'Not medical advice.'"
+                            )
+                            user_prompt = f"""
+We screened a batch of cases for CKD. Summarize insights for stakeholders.
+
+Metrics:
+- Positive rate: {pos_rate:.3f}
+- Average Prob_CKD: {avg_prob:.3f}
+- Rows: {len(batch_preds_df)}
+
+Task:
+1) Red flag overview (e.g., proportion likely CKD).
+2) High-level diet and exercise guidance appropriate for a mixed cohort.
+3) Follow-up checklist (repeat labs, referrals).
+4) End with: 'This is not medical advice; consult your clinician.'
+"""
+                            text = call_llm(system_prompt, user_prompt)
+                            if text:
+                                st.markdown(text)
 
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
@@ -303,8 +362,8 @@ with tab_metrics:
 # ---- Recommendations (alpha) ------------------------------------------------
 with tab_advice:
     st.markdown(
-        "**Use this tab for AI-assisted recommendations.** It interprets the latest prediction, CKD stage,"
-        " albuminuria category, and flags (BP, hyperkalemia, anemia) and drafts patient-friendly next steps.\n\n"
+        "**Use this tab for AI-assisted recommendations on the last single prediction.** "
+        "It interprets CKD stage, albuminuria, and flags (BP, hyperkalemia, anemia) and drafts patient-friendly next steps.\n\n"
         "_Safety rails:_ No medication dosing; not medical advice; PII removed."
     )
 
@@ -347,7 +406,6 @@ Constraints:
 - Include a short, readable 'next steps' list.
 - Add: 'This is not medical advice; consult your clinician.'
 """
-
         if st.button("Generate recommendations"):
             text = call_llm(system_prompt, user_prompt)
             if text:
