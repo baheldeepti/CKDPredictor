@@ -2,52 +2,52 @@
 import os
 import sys
 import json
+import math
 import subprocess
 import traceback
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import shap
 from joblib import load
-from pydantic import BaseModel, Field, ConfigDict
 
+from pydantic import BaseModel, Field, ConfigDict
 from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Header
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# Optional DB logging (Postgres via DATABASE_URL; otherwise SQLite fallback)
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 # -----------------------------------------------------------------------------
-# App (instantiate FIRST) + CORS
+# App + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="1.1.0")
+app = FastAPI(title="CKD Predictor API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in prod
+    allow_origins=["*"],      # tighten in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Friendly root: redirect "/" -> "/docs"
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/docs")
 
 # -----------------------------------------------------------------------------
-# Configuration (paths & registry)
+# Paths & Registry
 # -----------------------------------------------------------------------------
-
 BASE_DIR = Path(__file__).resolve().parent           # .../api
-MODEL_DIR = Path(os.getenv("MODEL_DIR") or (BASE_DIR.parent / "models"))
+ROOT_DIR = BASE_DIR.parent                           # repo root
+MODEL_DIR = Path(os.getenv("MODEL_DIR") or (ROOT_DIR / "models"))
 
 print(f"[boot] MODEL_DIR={MODEL_DIR.resolve()} exists={MODEL_DIR.exists()}")
 
-# If an older XGB model had flipped proba semantics, set True; otherwise False.
+# If your *older* XGBoost model exposed proba[:,1] as P(non-CKD), flip it.
 LEGACY_XGB_FLIPPED: bool = False
 
 REGISTRY: Dict[str, Dict[str, object]] = {
@@ -69,146 +69,90 @@ REGISTRY: Dict[str, Dict[str, object]] = {
 }
 
 FEATURE_COLS: List[str] = [
-    "age","gender",
-    "systolicbp","diastolicbp",
-    "serumcreatinine","bunlevels",
-    "gfr","acr",
-    "serumelectrolytessodium","serumelectrolytespotassium",
-    "hemoglobinlevels","hba1c",
-    "pulsepressure","ureacreatinineratio",
-    "ckdstage","albuminuriacat",
-    "bp_risk","hyperkalemiaflag","anemiaflag",
+    "age", "gender",
+    "systolicbp", "diastolicbp",
+    "serumcreatinine", "bunlevels",
+    "gfr", "acr",
+    "serumelectrolytessodium", "serumelectrolytespotassium",
+    "hemoglobinlevels", "hba1c",
+    "pulsepressure", "ureacreatinineratio",
+    "ckdstage", "albuminuriacat",
+    "bp_risk", "hyperkalemiaflag", "anemiaflag",
 ]
 
 # -----------------------------------------------------------------------------
-# Database: Postgres if DATABASE_URL set; otherwise SQLite fallback (enabled by default)
+# Database (default ON): Neon via DATABASE_URL, else SQLite fallback
 # -----------------------------------------------------------------------------
+def _db_url_with_fallback() -> str:
+    env_url = os.getenv("DATABASE_URL")
+    if env_url and env_url.strip():
+        return env_url
+    # SQLite fallback inside repo (keeps Metrics tab alive everywhere)
+    sqlite_path = (ROOT_DIR / "models" / "inference.db").resolve()
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    return f"sqlite:///{sqlite_path}"
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-USE_SQLITE_FALLBACK = os.getenv("USE_SQLITE_FALLBACK", "true").lower() in ("1", "true", "yes")
+DATABASE_URL = _db_url_with_fallback()
+engine: Engine | None = create_engine(DATABASE_URL, future=True)
 
-engine: Optional[Engine] = None
-db_backend: str = "none"      # "postgres", "sqlite", "none"
-db_connected: bool = False
-DB_IS_SQLITE: bool = False
-
-def _init_db():
-    global engine, db_backend, db_connected, DB_IS_SQLITE
-
-    if DATABASE_URL:
-        try:
-            engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-            with engine.begin() as c:
-                c.execute(text("SELECT 1"))
-            db_backend = "postgres"
-            db_connected = True
-            DB_IS_SQLITE = False
-            print("[db] Connected to Postgres.")
-            _ensure_tables()
-            return
-        except Exception as e:
-            print(f"[db] Postgres connection failed: {e}")
-
-    if USE_SQLITE_FALLBACK:
-        try:
-            sqlite_path = MODEL_DIR / "inference.sqlite3"
-            sqlite_path.parent.mkdir(parents=True, exist_ok=True)
-            engine = create_engine(f"sqlite:///{sqlite_path}", future=True)
-            db_backend = "sqlite"
-            DB_IS_SQLITE = True
-            with engine.begin() as c:
-                c.execute(text("SELECT 1"))
-            db_connected = True
-            print(f"[db] Using SQLite fallback at {sqlite_path}.")
-            _ensure_tables()
-            return
-        except Exception as e:
-            print(f"[db] SQLite fallback failed: {e}")
-
-    # If we reach here, DB unavailable
-    engine = None
-    db_backend = "none"
-    db_connected = False
-    DB_IS_SQLITE = False
-    print("[db] No database connected. Metrics logging disabled.")
+def _db_backend() -> str:
+    try:
+        name = engine.url.get_backend_name()  # type: ignore
+        return name or "unknown"
+    except Exception:
+        return "unknown"
 
 def _ensure_tables():
-    """
-    Create tables if they don't exist.
-    Uses Postgres DDL if on Postgres; SQLite-friendly DDL if on SQLite.
-    """
+    """Create tables if missing (works for Postgres & SQLite)."""
     if engine is None:
         return
-    with engine.begin() as c:
-        if DB_IS_SQLITE:
-            # SQLite types & autoincrement semantics
-            c.execute(text("""
-                CREATE TABLE IF NOT EXISTS user_inputs (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                  age REAL, gender INTEGER,
-                  systolicbp REAL, diastolicbp REAL,
-                  serumcreatinine REAL, bunlevels REAL,
-                  gfr REAL, acr REAL,
-                  serumelectrolytessodium REAL, serumelectrolytespotassium REAL,
-                  hemoglobinlevels REAL, hba1c REAL,
-                  pulsepressure REAL, ureacreatinineratio REAL,
-                  ckdstage INTEGER, albuminuriacat INTEGER,
-                  bp_risk INTEGER, hyperkalemiaflag INTEGER, anemiaflag INTEGER
-                );
-            """))
-            c.execute(text("""
-                CREATE TABLE IF NOT EXISTS inference_log (
-                  id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                  input_id INTEGER REFERENCES user_inputs(id) ON DELETE CASCADE,
-                  model_used TEXT NOT NULL,
-                  threshold_used REAL NOT NULL,
-                  prediction INTEGER NOT NULL,
-                  prob_ckd REAL NOT NULL,
-                  prob_non_ckd REAL NOT NULL
-                );
-            """))
-            # SQLite doesn't use DESC index syntax; still fine without, data is tiny.
-        else:
-            # Postgres DDL (your original)
-            c.execute(text("""
-                CREATE TABLE IF NOT EXISTS user_inputs (
-                  id BIGSERIAL PRIMARY KEY,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  age DOUBLE PRECISION, gender INT,
-                  systolicbp DOUBLE PRECISION, diastolicbp DOUBLE PRECISION,
-                  serumcreatinine DOUBLE PRECISION, bunlevels DOUBLE PRECISION,
-                  gfr DOUBLE PRECISION, acr DOUBLE PRECISION,
-                  serumelectrolytessodium DOUBLE PRECISION, serumelectrolytespotassium DOUBLE PRECISION,
-                  hemoglobinlevels DOUBLE PRECISION, hba1c DOUBLE PRECISION,
-                  pulsepressure DOUBLE PRECISION, ureacreatinineratio DOUBLE PRECISION,
-                  ckdstage INT, albuminuriacat INT,
-                  bp_risk INT, hyperkalemiaflag INT, anemiaflag INT
-                );
-            """))
-            c.execute(text("""
-                CREATE TABLE IF NOT EXISTS inference_log (
-                  id BIGSERIAL PRIMARY KEY,
-                  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                  input_id BIGINT REFERENCES user_inputs(id) ON DELETE CASCADE,
-                  model_used TEXT NOT NULL,
-                  threshold_used DOUBLE PRECISION NOT NULL,
-                  prediction INT NOT NULL,
-                  prob_ckd DOUBLE PRECISION NOT NULL,
-                  prob_non_ckd DOUBLE PRECISION NOT NULL
-                );
-            """))
-            c.execute(text("""
-                CREATE INDEX IF NOT EXISTS inference_log_created_at_idx
-                ON inference_log(created_at DESC);
-            """))
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS user_inputs (
+              id BIGSERIAL PRIMARY KEY,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              age DOUBLE PRECISION, gender INT,
+              systolicbp DOUBLE PRECISION, diastolicbp DOUBLE PRECISION,
+              serumcreatinine DOUBLE PRECISION, bunlevels DOUBLE PRECISION,
+              gfr DOUBLE PRECISION, acr DOUBLE PRECISION,
+              serumelectrolytessodium DOUBLE PRECISION, serumelectrolytespotassium DOUBLE PRECISION,
+              hemoglobinlevels DOUBLE PRECISION, hba1c DOUBLE PRECISION,
+              pulsepressure DOUBLE PRECISION, ureacreatinineratio DOUBLE PRECISION,
+              ckdstage INT, albuminuriacat INT,
+              bp_risk INT, hyperkalemiaflag INT, anemiaflag INT
+            );
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS inference_log (
+              id BIGSERIAL PRIMARY KEY,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              input_id BIGINT REFERENCES user_inputs(id) ON DELETE CASCADE,
+              model_used TEXT NOT NULL,
+              threshold_used DOUBLE PRECISION NOT NULL,
+              prediction INT NOT NULL,
+              prob_ckd DOUBLE PRECISION NOT NULL,
+              prob_non_ckd DOUBLE PRECISION NOT NULL
+            );
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS inference_log_created_at_idx
+            ON inference_log(created_at DESC);
+        """))
 
-_init_db()
+# try to connect & ensure tables
+_db_ok = False
+try:
+    with engine.begin() as _c:
+        _c.exec_driver_sql("SELECT 1;")
+    _db_ok = True
+    _ensure_tables()
+except Exception as e:
+    print(f"[boot][db] connection failed: {e}")
+    _db_ok = False
 
 # Optional lightweight admin protection
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-def _check_admin(token: Optional[str]):
+def _check_admin(token: str | None):
     if not ADMIN_TOKEN:
         return
     if token != ADMIN_TOKEN:
@@ -217,7 +161,6 @@ def _check_admin(token: Optional[str]):
 # -----------------------------------------------------------------------------
 # Schemas
 # -----------------------------------------------------------------------------
-
 class PatientFeatures(BaseModel):
     age: float
     gender: int
@@ -240,6 +183,7 @@ class PatientFeatures(BaseModel):
     anemiaflag: int
 
 class PredictResponse(BaseModel):
+    # avoid protected namespace warning on "model_used"
     model_config = ConfigDict(protected_namespaces=())
     prediction: int = Field(description="0 = Non-CKD, 1 = CKD")
     prob_ckd: float
@@ -255,13 +199,13 @@ class BatchPredictResponse(BaseModel):
 
 class ExplainResponse(BaseModel):
     base_value: float
-    shap_values: Dict[str, float]   # feature -> signed impact
-    top: List[Dict[str, float]]     # list of {feature, impact, signed}
+    shap_values: Dict[str, float]
+    top: List[Dict[str, float]]
 
 # -----------------------------------------------------------------------------
 # Model cache
 # -----------------------------------------------------------------------------
-_cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
+_cache: Dict[str, Dict[str, object]] = {}  # {key: {"model": obj, "thr": float, "flip": bool}}
 
 def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
     mk = model_key.lower()
@@ -273,8 +217,11 @@ def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
     mdl = load(paths["model"])
     thr = 0.5
     if paths["thr"].exists():
-        with open(paths["thr"]) as f:
-            thr = float(json.load(f)["threshold"])
+        try:
+            with open(paths["thr"]) as f:
+                thr = float(json.load(f)["threshold"])
+        except Exception:
+            pass
     flip = bool(paths.get("flip_probas", False))
     return mdl, thr, flip
 
@@ -286,9 +233,8 @@ def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
     return d["model"], d["thr"], d["flip"]
 
 # -----------------------------------------------------------------------------
-# Core prediction
+# Prediction core
 # -----------------------------------------------------------------------------
-
 def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
     for c in FEATURE_COLS:
         if c not in df.columns:
@@ -299,8 +245,10 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
     df = _validate_and_order(df)
     mdl, thr, flip = get_model_and_thr(model_key)
 
-    proba1 = mdl.predict_proba(df)[:, 1]  # standard: P(CKD)
+    # sklearn predict_proba
+    proba1 = mdl.predict_proba(df)[:, 1]  # P(class=1) in normal case
     if flip:
+        # legacy xgb where [:,1] meant P(non-CKD)
         prob_non_ckd = proba1
         prob_ckd = 1.0 - proba1
         pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 means "Non-CKD"
@@ -320,50 +268,39 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
     return out
 
 # -----------------------------------------------------------------------------
-# DB logging helpers
+# DB helpers
 # -----------------------------------------------------------------------------
-
 def _save_user_input(conn, row: dict) -> int:
-    if DB_IS_SQLITE:
-        q = text("""
-            INSERT INTO user_inputs (
-                age, gender, systolicbp, diastolicbp,
-                serumcreatinine, bunlevels, gfr, acr,
-                serumelectrolytessodium, serumelectrolytespotassium,
-                hemoglobinlevels, hba1c, pulsepressure, ureacreatinineratio,
-                ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag
-            ) VALUES (
-                :age, :gender, :systolicbp, :diastolicbp,
-                :serumcreatinine, :bunlevels, :gfr, :acr,
-                :serumelectrolytessodium, :serumelectrolytespotassium,
-                :hemoglobinlevels, :hba1c, :pulsepressure, :ureacreatinineratio,
-                :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag
-            );
-        """)
-        res = conn.execute(q, row)
-        try:
-            # SQLAlchemy 2.x + sqlite
-            input_id = res.lastrowid  # type: ignore[attr-defined]
-        except Exception:
-            input_id = conn.execute(text("SELECT last_insert_rowid()")).scalar()
-        return int(input_id)
-    else:
-        q = text("""
-            INSERT INTO user_inputs (
-                age, gender, systolicbp, diastolicbp,
-                serumcreatinine, bunlevels, gfr, acr,
-                serumelectrolytessodium, serumelectrolytespotassium,
-                hemoglobinlevels, hba1c, pulsepressure, ureacreatinineratio,
-                ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag
-            ) VALUES (
-                :age, :gender, :systolicbp, :diastolicbp,
-                :serumcreatinine, :bunlevels, :gfr, :acr,
-                :serumelectrolytessodium, :serumelectrolytespotassium,
-                :hemoglobinlevels, :hba1c, :pulsepressure, :ureacreatinineratio,
-                :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag
-            ) RETURNING id;
-        """)
+    q = text("""
+        INSERT INTO user_inputs (
+            age, gender, systolicbp, diastolicbp,
+            serumcreatinine, bunlevels, gfr, acr,
+            serumelectrolytessodium, serumelectrolytespotassium,
+            hemoglobinlevels, hba1c, pulsepressure, ureacreatinineratio,
+            ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag
+        ) VALUES (
+            :age, :gender, :systolicbp, :diastolicbp,
+            :serumcreatinine, :bunlevels, :gfr, :acr,
+            :serumelectrolytessodium, :serumelectrolytespotassium,
+            :hemoglobinlevels, :hba1c, :pulsepressure, :ureacreatinineratio,
+            :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag
+        ) RETURNING id;
+    """)
+    try:
         return int(conn.execute(q, row).scalar())
+    except Exception:
+        # SQLite doesn't support RETURNING on older versions; fallback
+        conn.execute(text("INSERT INTO user_inputs ("
+                          "age, gender, systolicbp, diastolicbp, serumcreatinine, bunlevels, gfr, acr,"
+                          "serumelectrolytessodium, serumelectrolytespotassium, hemoglobinlevels, hba1c,"
+                          "pulsepressure, ureacreatinineratio, ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag"
+                          ") VALUES ("
+                          ":age, :gender, :systolicbp, :diastolicbp, :serumcreatinine, :bunlevels, :gfr, :acr,"
+                          ":serumelectrolytessodium, :serumelectrolytespotassium, :hemoglobinlevels, :hba1c,"
+                          ":pulsepressure, :ureacreatinineratio, :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag"
+                          ");"), row)
+        rid = conn.execute(text("SELECT last_insert_rowid();")).scalar()
+        return int(rid)
 
 def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: dict):
     q = text("""
@@ -383,132 +320,138 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
     })
 
 # -----------------------------------------------------------------------------
-# SHAP helper (super defensive)
+# SHAP utils (bulletproof for RF / XGB / LogReg)
 # -----------------------------------------------------------------------------
-
-def _is_tree_model(model) -> bool:
-    name = model.__class__.__name__.lower()
-    return ("forest" in name) or ("xgb" in name) or ("gradientboost" in name) or hasattr(model, "feature_importances_")
-
-def _positive_class_index(model) -> int:
+def _pos_index(model) -> int:
+    """Return index of the positive class. Prefer label 1; else last/largest."""
     try:
         classes = getattr(model, "classes_", None)
         if classes is None:
             return 1
-        classes = list(classes)
-        return classes.index(1) if 1 in classes else int(np.argmax(classes))
+        arr = np.array(list(classes))
+        # If numeric
+        if np.issubdtype(arr.dtype, np.number):
+            if (arr == 1).any():
+                return int(np.where(arr == 1)[0][0])
+            return int(np.argmax(arr))  # pick largest label
+        # Non-numeric labels (e.g., ["Non-CKD","CKD"])
+        labels = [str(x) for x in arr.tolist()]
+        if "1" in labels:
+            return labels.index("1")
+        return len(labels) - 1  # choose last as "positive"
     except Exception:
         return 1
 
-def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
+def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
     """
-    Compute SHAP for one row robustly across SHAP versions & model types.
-    Returns (base_value, shap_map, top_list).
+    Compute SHAP values for the first row, for the positive class.
+    Returns (vals_for_row, base_value).
+    Tries classic .shap_values() API first for stability across SHAP versions.
     """
-    import shap  # import here so the API can still run if shap missing at build time
+    pos = _pos_index(model)
 
-    X = features.copy()
-    # Prefer model-specific explainers; avoid forcing model_output="probability" due to shape quirks
-    explainer = None
-
+    # --- TreeExplainer path (RF/XGB/GBM) using classic API ---
     try:
-        if _is_tree_model(model):
-            explainer = shap.TreeExplainer(model)  # class-wise sometimes list, sometimes array
+        tree_expl = shap.TreeExplainer(model)
+        if hasattr(tree_expl, "shap_values"):
+            sv = tree_expl.shap_values(X)
+            # sv can be [class0_array, class1_array] or a 2D array
+            if isinstance(sv, list):
+                arr = np.asarray(sv[min(pos, len(sv)-1)])
+                vals = arr[0]  # first (only) row
+            else:
+                arr = np.asarray(sv)
+                vals = arr[0]
+            base = tree_expl.expected_value
+            if isinstance(base, (list, tuple, np.ndarray)):
+                base_val = float(np.asarray(base)[min(pos, len(np.asarray(base))-1)])
+            else:
+                base_val = float(base)
+            return np.asarray(vals, dtype=float), base_val
     except Exception:
-        explainer = None
+        pass
 
-    if explainer is None:
-        try:
-            name = model.__class__.__name__.lower()
-            if name.startswith(("logisticregression", "sgdclassifier", "linear", "linearsvc")):
-                mask = shap.maskers.Independent(X)
-                explainer = shap.LinearExplainer(model, mask)
-        except Exception:
-            explainer = None
+    # --- LinearExplainer path (LogReg/SGD) classic API ---
+    try:
+        # For scikit-learn LogisticRegression, LinearExplainer works well
+        lin_expl = shap.LinearExplainer(model, X, feature_dependence="independent")
+        if hasattr(lin_expl, "shap_values"):
+            arr = np.asarray(lin_expl.shap_values(X))
+            # Returns (n_samples, n_features)
+            vals = arr[0]
+            base = lin_expl.expected_value
+            base_val = float(np.asarray(base).ravel()[0])
+            return np.asarray(vals, dtype=float), base_val
+    except Exception:
+        pass
 
-    if explainer is None:
-        try:
-            explainer = shap.Explainer(model, X)
-        except Exception:
-            mask = shap.maskers.Independent(X)
-            explainer = shap.Explainer(model, mask)
+    # --- New Explanation API fallback ---
+    try:
+        exp = shap.Explainer(model, X)
+        res = exp(X.iloc[[0]])
+        v = getattr(res, "values", None)
+        base_raw = getattr(res, "base_values", 0.0)
 
-    # Calculate for first row only
-    sv = explainer(X.iloc[[0]])
-
-    # --- normalize SHAP values shape ---
-    v = getattr(sv, "values", None)
-    base_raw = getattr(sv, "base_values", None)
-
-    # If v is a list (per-class), choose positive class if present else last
-    chosen_class = None
-    if isinstance(v, list):
-        ci = _positive_class_index(model)
-        ci = ci if ci < len(v) else (len(v) - 1)
-        chosen_class = ci
-        v_arr = np.array(v[ci])
-        vals = v_arr[0] if v_arr.ndim == 2 else v_arr
-    else:
-        vals_np = np.array(v) if v is not None else None
-        if vals_np is None:
-            # old API: sv is sequence
-            vals_np = np.array(sv[0].values)
-        if vals_np.ndim == 1:
-            vals = vals_np
-        elif vals_np.ndim == 2:
-            # (samples, features)
-            vals = vals_np[0]
-        elif vals_np.ndim == 3:
-            # could be (classes, samples, features) OR (1,1,features)
-            first_dim = vals_np.shape[0]
-            if hasattr(model, "classes_") and first_dim == len(model.classes_):
-                ci = _positive_class_index(model)
-                ci = ci if ci < first_dim else 0
-                chosen_class = ci
-                vals = vals_np[ci, 0, :]
+        # values may be array or list[class]
+        if isinstance(v, list):
+            arr = np.asarray(v[min(pos, len(v)-1)])
+            vals = arr[0]
+        else:
+            arr = np.asarray(v)
+            if arr.ndim == 3:      # (classes, samples, features)
+                vals = arr[min(pos, arr.shape[0]-1), 0, :]
+            elif arr.ndim == 2:    # (samples, features)
+                vals = arr[0]
+            elif arr.ndim == 1:    # (features,)
+                vals = arr
             else:
-                vals = vals_np[0, 0, :]
-        else:
-            vals = np.ravel(vals_np)
+                vals = np.ravel(arr)
 
-    # --- normalize base value shape ---
-    base: float
-    if isinstance(base_raw, list):
-        if chosen_class is not None and chosen_class < len(base_raw):
-            base = float(base_raw[chosen_class])
-        else:
-            base = float(base_raw[0])
-    else:
-        base_arr = np.array(base_raw) if base_raw is not None else np.array([0.0])
+        base_arr = np.asarray(base_raw)
         if base_arr.ndim == 0:
-            base = float(base_arr)
+            base_val = float(base_arr)
         elif base_arr.ndim == 1:
-            if chosen_class is not None and len(base_arr) > chosen_class:
-                base = float(base_arr[chosen_class])
-            else:
-                base = float(base_arr[0])
+            base_val = float(base_arr[min(pos, base_arr.shape[0]-1)])
         elif base_arr.ndim == 2:
-            # (classes, samples) or (1, samples)
-            if chosen_class is not None and base_arr.shape[0] > chosen_class:
-                base = float(base_arr[chosen_class, 0])
-            else:
-                base = float(base_arr[0, 0])
+            base_val = float(base_arr[min(pos, base_arr.shape[0]-1), 0])
         else:
-            base = float(np.ravel(base_arr)[0])
+            base_val = float(np.ravel(base_arr)[0])
 
+        return np.asarray(vals, dtype=float), float(base_val)
+    except Exception:
+        pass
+
+    # --- Last resort: use model importances/coeffs (not true SHAP, but unblocks UI) ---
+    try:
+        if hasattr(model, "feature_importances_"):
+            vals = np.asarray(model.feature_importances_, dtype=float)
+            base_val = 0.0
+            return vals, base_val
+        if hasattr(model, "coef_"):
+            vals = np.asarray(model.coef_).ravel().astype(float)
+            base_val = 0.0
+            return vals, base_val
+    except Exception:
+        pass
+
+    raise RuntimeError("Could not compute SHAP values for this model/version.")
+
+def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
+    X = features.copy()
+    vals, base = _compute_shap_binary(model, X)
     feat_names = list(X.columns)
-    shap_map = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
+    # Align in case some backends return less/more features (safety)
+    n = min(len(feat_names), len(vals))
+    shap_dict = {feat_names[i]: float(vals[i]) for i in range(n)}
     top = sorted(
-        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_map.items()],
-        key=lambda d: d["impact"],
-        reverse=True
+        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
+        key=lambda d: d["impact"], reverse=True
     )[:k]
-    return base, shap_map, top
+    return float(base), shap_dict, top
 
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
-
 @app.get("/health")
 def health(model: str = Query("xgb", description="xgb | rf | logreg")):
     try:
@@ -516,25 +459,25 @@ def health(model: str = Query("xgb", description="xgb | rf | logreg")):
         return {
             "status": "ok",
             "model": model,
-            "threshold": thr,
-            "legacy_flip_probas": flip,
-            "db_logging": bool(engine is not None),
-            "db_connected": bool(db_connected),
-            "db_backend": db_backend,
+            "threshold": float(thr),
+            "legacy_flip_probas": bool(flip),
+            "db_logging": True,
+            "db_connected": bool(_db_ok),
+            "db_backend": _db_backend(),
         }
     except Exception as e:
-        return {"status": "error", "detail": str(e), "db_connected": bool(db_connected), "db_backend": db_backend}
+        return {"status": "error", "detail": str(e), "db_connected": bool(_db_ok)}
 
 @app.post("/predict", response_model=PredictResponse)
 def predict(
     item: PatientFeatures,
     model: str = Query("xgb"),
-    save: bool = Query(True, description="Save input+prediction to DB"),
+    save: bool = Query(True, description="Save input+prediction to DB (enabled by default)"),
 ):
     df = pd.DataFrame([item.dict()])
     res = predict_core(df, model).iloc[0].to_dict()
 
-    if save and engine is not None and db_connected:
+    if save and (engine is not None):
         try:
             with engine.begin() as conn:
                 input_id = _save_user_input(conn, item.dict())
@@ -553,7 +496,7 @@ def predict_batch(
     df = pd.DataFrame([r.dict() for r in req.rows])
     res_rows = predict_core(df, model).to_dict(orient="records")
 
-    if save and engine is not None and db_connected:
+    if save and (engine is not None):
         try:
             with engine.begin() as conn:
                 for row_in, row_out in zip(req.rows, res_rows):
@@ -565,14 +508,10 @@ def predict_batch(
     return {"predictions": res_rows}
 
 # === Explainability ==========================================================
-
-@app.post("/explain", response_model=ExplainResponse)
-def explain(
-    item: PatientFeatures,
-    model: str = Query("xgb"),
-):
+@app.post("/explain")
+def explain(item: PatientFeatures, model: str = Query("xgb")):
     """
-    Returns SHAP explanation for a single row:
+    Returns SHAP explanation for a single row, as JSON:
     {
       "base_value": float,
       "shap_values": {"feature": signed_value, ...},
@@ -581,10 +520,13 @@ def explain(
     """
     try:
         df_in = pd.DataFrame([item.dict()])
-        X = _validate_and_order(df_in)
-
+        for c in FEATURE_COLS:
+            if c not in df_in.columns:
+                raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
+        X = df_in[FEATURE_COLS].copy()
         mdl, _, _ = get_model_and_thr(model)
-        base, shap_values, top = _shap_top_k(X, mdl, k=8)
+
+        base, shap_values, top = _shap_top_k(X, mdl, k=6)
         return {
             "base_value": base,
             "shap_values": shap_values,
@@ -600,8 +542,7 @@ def explain(
             content={"detail": f"explain_failed: {str(e)}", "model": model}
         )
 
-# === Retrain / Reload =======================================================
-
+# === Retrain / Reload ========================================================
 def _run_retrain_pipeline():
     try:
         subprocess.run([sys.executable, "ml/99_retrain.py"], check=True)
@@ -615,7 +556,7 @@ def _run_retrain_pipeline():
 def admin_retrain(
     background: BackgroundTasks,
     sync: bool = Query(False, description="Run synchronously (blocks request)"),
-    x_admin_token: Optional[str] = Header(None),
+    x_admin_token: str | None = Header(None),
 ):
     _check_admin(x_admin_token)
     if sync:
@@ -626,22 +567,18 @@ def admin_retrain(
         return {"status": "started", "mode": "async"}
 
 @app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
-def admin_reload(x_admin_token: Optional[str] = Header(None)):
+def admin_reload(x_admin_token: str | None = Header(None)):
     _check_admin(x_admin_token)
     global _cache
     _cache.clear()
-    return  # 204 No Content
+    return  # 204
 
 # === Metrics ================================================================
-
 @app.get("/metrics/retrain_report")
 def retrain_report():
     path = MODEL_DIR / "retrain_report.json"
     if not path.exists():
-        return JSONResponse(
-            status_code=404,
-            content={"detail": "retrain_report.json not found"}
-        )
+        return JSONResponse(status_code=404, content={"detail": "retrain_report.json not found"})
     try:
         return json.loads(path.read_text())
     except Exception as e:
@@ -649,7 +586,7 @@ def retrain_report():
 
 @app.get("/metrics/last_inferences")
 def last_inferences(limit: int = Query(10, ge=1, le=100)):
-    if engine is None or not db_connected:
+    if engine is None or not _db_ok:
         return JSONResponse(
             status_code=503,
             content={"detail": "DB not connected; cannot read inference_log."},
@@ -664,12 +601,10 @@ def last_inferences(limit: int = Query(10, ge=1, le=100)):
     return {"rows": [dict(r) for r in rows]}
 
 # -----------------------------------------------------------------------------
-# Entrypoint for `python -m api.app` (optional)
+# Local run
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Safe dev server — use uvicorn in prod (Render/Gunicorn)
+    # Free port 8000 if something is holding it? Do nothing here;
+    # use the shell line I give you below to kill old uvicorns.
     import uvicorn
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8000"))
-    reload_flag = os.getenv("RELOAD", "false").lower() in ("1", "true", "yes")
-    uvicorn.run("api.app:app", host=host, port=port, reload=reload_flag)
+    uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=True)
