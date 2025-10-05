@@ -549,6 +549,8 @@ def health(model: str = Query("xgb", description="xgb | rf | logreg")):
 def ready():
     return {
         "ok": True,
+        "db_connected": bool(_db_ok),
+        "db_backend": _db_backend(),
         "agents": bool(multi_agent_plan),
         "whatif": bool(simulate_whatif),
         "counterfactual": bool(counterfactual),
@@ -560,6 +562,7 @@ def ready():
             "similarity": _import_errors.get("similarity"),
         },
     }
+
 
 
 @app.post("/predict/batch", response_model=BatchPredictResponse)
