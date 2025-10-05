@@ -24,10 +24,10 @@ MODEL_CHOICES = [
 ]
 
 # Optional LLM config (OpenAI-compatible)
-LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")   # openai | together | openrouter | custom
-LLM_API_KEY   = st.secrets.get("LLM_API_KEY", "")
-LLM_BASE_URL  = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")  # default to OpenRouter
-LLM_MODEL     = st.secrets.get("LLM_MODEL", "openrouter/auto")  # or any model your gateway supports
+LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")           # openai | together | openrouter | custom
+LLM_API_KEY  = st.secrets.get("LLM_API_KEY", "")
+LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")  # default to OpenRouter
+LLM_MODEL    = st.secrets.get("LLM_MODEL", "openrouter/auto")         # or any model your gateway supports
 
 st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
 
@@ -63,7 +63,9 @@ def call_llm(system_prompt: str, user_prompt: str):
     except Exception:
         st.error("Package `openai` missing. Install with: `pip install openai`")
         return None
+
     try:
+        # For OpenRouter, OpenAI, Together (via compatible base_url)
         client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
         resp = client.chat.completions.create(
             model=LLM_MODEL,
@@ -99,7 +101,6 @@ def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
 def sample_records_df():
     # 5 realistic synthetic rows matching the schema
     rows = [
-        # age, gender, sys, dia, creat, bun, gfr, acr, Na, K, Hgb, HbA1c, PP, U/C, stage, alb, BP, HK, anemia
         [65, 1, 148, 86, 2.1, 32, 52, 120, 139, 4.8, 12.2, 6.5, 62, 15.2, 2, 2, 1, 0, 0],
         [54, 0, 132, 82, 1.6, 28, 65, 35, 141, 4.3, 13.5, 6.1, 50, 17.5, 2, 2, 1, 0, 0],
         [72, 1, 160, 95, 3.4, 48, 38, 420, 137, 5.7, 11.2, 7.8, 65, 12.5, 3, 3, 1, 1, 1],
@@ -113,6 +114,9 @@ if "last_pred_payload" not in st.session_state:
     st.session_state["last_pred_payload"] = None
 if "last_pred_result" not in st.session_state:
     st.session_state["last_pred_result"] = None
+# Keep batch preds across reruns for insights
+if "batch_preds" not in st.session_state:
+    st.session_state["batch_preds"] = None
 
 # ===== Header =================================================================
 st.title("🩺 CKD Predictor")
@@ -122,7 +126,7 @@ st.caption("Single & batch predictions with thresholding, metrics, retraining, a
 with st.sidebar:
     st.header("Settings")
     api_url = st.text_input("API URL", API_URL)
-    model_label, model_key = st.selectbox("Model", MODEL_CHOICES, index=0, format_func=lambda x: x[0])
+    (model_label, model_key) = st.selectbox("Model", MODEL_CHOICES, index=0, format_func=lambda x: x[0])
 
     c1, c2 = st.columns(2)
     with c1:
@@ -250,7 +254,6 @@ with tab_batch:
     file = st.file_uploader("Upload CSV", type=["csv"])
     retrain_after_batch = st.checkbox("Retrain after batch", value=False)
 
-    batch_preds_df = None
     if file:
         try:
             df = pd.read_csv(file)
@@ -261,55 +264,66 @@ with tab_batch:
                 st.dataframe(df.head())
 
                 if st.button("Run Batch Predictions"):
-                    rows = df.to_dict(orient="records")
-                    r = requests.post(
-                        f"{api_url}/predict/batch",
-                        params={"model": model_key},
-                        json={"rows": rows},
-                        timeout=60
-                    )
-                    r.raise_for_status()
-                    preds = pd.DataFrame(r.json()["predictions"])
-                    st.success("Batch complete.")
-                    ckd_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
-                    st.markdown(f"**CKD positive rate:** {ckd_rate:.1%}  •  rows: {len(preds)}")
-                    st.dataframe(preds.head())
+                    try:
+                        rows = df.to_dict(orient="records")
+                        r = requests.post(
+                            f"{api_url}/predict/batch",
+                            params={"model": model_key},
+                            json={"rows": rows},
+                            timeout=60
+                        )
+                        r.raise_for_status()
+                        preds = pd.DataFrame(r.json()["predictions"])
+                        st.session_state["batch_preds"] = preds   # persist across reruns
 
-                    merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-                    st.download_button(
-                        "Download Results CSV",
-                        data=merged.to_csv(index=False).encode("utf-8"),
-                        file_name="ckd_batch_predictions.csv",
-                        mime="text/csv"
-                    )
+                        st.success("Batch complete.")
+                        ckd_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
+                        st.markdown(f"**CKD positive rate:** {ckd_rate:.1%}  •  rows: {len(preds)}")
+                        st.dataframe(preds.head())
 
-                    batch_preds_df = preds
+                        merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
+                        st.download_button(
+                            "Download Results CSV",
+                            data=merged.to_csv(index=False).encode("utf-8"),
+                            file_name="ckd_batch_predictions.csv",
+                            mime="text/csv"
+                        )
 
-                    if retrain_after_batch:
-                        try:
-                            rr = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
-                            st.success("Retraining started. Use Health in the sidebar to check when updated.")
-                        except Exception as e:
-                            st.error(f"Retrain call failed: {e}")
+                        if retrain_after_batch:
+                            try:
+                                rr = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
+                                st.success("Retraining started. Use Health in the sidebar to check when updated.")
+                            except Exception as e:
+                                st.error(f"Retrain call failed: {e}")
+                    except requests.HTTPError as e:
+                        st.error(f"Batch API failed: {e}  •  Response: {getattr(e, 'response', None) and e.response.text}")
+                    except Exception as e:
+                        st.error(f"Batch call error: {e}")
+        except Exception as e:
+            st.error(f"Failed to read CSV: {e}")
 
-                # Cohort insights via LLM (optional)
-                if batch_preds_df is not None and not batch_preds_df.empty:
-                    with st.expander("Generate cohort insights (AI)"):
-                        if st.button("Summarize cohort"):
-                            pos_rate = batch_preds_df["prediction"].mean()
-                            avg_prob = batch_preds_df.get("prob_ckd", pd.Series([0])).mean()
-                            system_prompt = (
-                                "You are a cautious, clinical assistant creating cohort insights for CKD screening.\n"
-                                "Do not give medication dosing. Provide red flags, diet/exercise high-level guidance,\n"
-                                "and a follow-up checklist. Add 'Not medical advice.'"
-                            )
-                            user_prompt = f"""
+    # --- Cohort insights (AI) ---
+    with st.expander("Generate cohort insights (AI)"):
+        st.caption("Summarize the most recent batch results using your LLM key (OpenRouter/OpenAI/etc.).")
+        preds = st.session_state.get("batch_preds")
+        if preds is None or preds.empty:
+            st.info("Run a batch first to enable insights.")
+        else:
+            if st.button("Summarize cohort"):
+                pos_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
+                avg_prob = preds["prob_ckd"].mean() if "prob_ckd" in preds else 0.0
+                system_prompt = (
+                    "You are a cautious, clinical assistant creating cohort insights for CKD screening.\n"
+                    "Do not give medication dosing. Provide red flags, diet/exercise high-level guidance,\n"
+                    "and a follow-up checklist. Add 'Not medical advice.'"
+                )
+                user_prompt = f"""
 We screened a batch of cases for CKD. Summarize insights for stakeholders.
 
 Metrics:
 - Positive rate: {pos_rate:.3f}
 - Average Prob_CKD: {avg_prob:.3f}
-- Rows: {len(batch_preds_df)}
+- Rows: {len(preds)}
 
 Task:
 1) Red flag overview (e.g., proportion likely CKD).
@@ -317,12 +331,11 @@ Task:
 3) Follow-up checklist (repeat labs, referrals).
 4) End with: 'This is not medical advice; consult your clinician.'
 """
-                            text = call_llm(system_prompt, user_prompt)
-                            if text:
-                                st.markdown(text)
-
-        except Exception as e:
-            st.error(f"Failed to read CSV: {e}")
+                text = call_llm(system_prompt, user_prompt)
+                if text:
+                    st.markdown(text)
+                else:
+                    st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
 
 # ---- Metrics ----------------------------------------------------------------
 with tab_metrics:
@@ -410,3 +423,5 @@ Constraints:
             text = call_llm(system_prompt, user_prompt)
             if text:
                 st.markdown(text)
+            else:
+                st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
