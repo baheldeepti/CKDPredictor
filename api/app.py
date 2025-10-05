@@ -1,4 +1,4 @@
-# api/app.py
+o# api/app.py
 import os
 import sys
 import json
@@ -584,6 +584,30 @@ def predict_batch(
             print(f"[warn] batch logging failed: {e}")
 
     return {"predictions": res_rows}
+
+@app.post(
+    "/predict",
+    response_model=PredictResponse,
+    tags=["Predict"],
+    summary="Predict CKD for a single patient row"
+)
+def predict(
+    item: PatientFeatures,
+    model: str = Query("xgb", description="Model key: xgb | rf | logreg"),
+    save: bool = Query(True, description="Save input+prediction to DB (default True)"),
+):
+    df = pd.DataFrame([item.dict()])
+    res = predict_core(df, model).iloc[0].to_dict()
+
+    if save and (engine is not None):
+        try:
+            with engine.begin() as conn:
+                input_id = _save_user_input(conn, item.dict())
+                _save_inference(conn, input_id, res["model_used"], res["threshold_used"], res)
+        except Exception as e:
+            print(f"[warn] logging failed: {e}")
+
+    return res
 
 # -----------------------------------------------------------------------------
 # Explainability
