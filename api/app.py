@@ -2,7 +2,6 @@
 import os
 import sys
 import json
-import math
 import subprocess
 import traceback
 from pathlib import Path
@@ -183,7 +182,6 @@ class PatientFeatures(BaseModel):
     anemiaflag: int
 
 class PredictResponse(BaseModel):
-    # avoid protected namespace warning on "model_used"
     model_config = ConfigDict(protected_namespaces=())
     prediction: int = Field(description="0 = Non-CKD, 1 = CKD")
     prob_ckd: float
@@ -290,15 +288,17 @@ def _save_user_input(conn, row: dict) -> int:
         return int(conn.execute(q, row).scalar())
     except Exception:
         # SQLite doesn't support RETURNING on older versions; fallback
-        conn.execute(text("INSERT INTO user_inputs ("
-                          "age, gender, systolicbp, diastolicbp, serumcreatinine, bunlevels, gfr, acr,"
-                          "serumelectrolytessodium, serumelectrolytespotassium, hemoglobinlevels, hba1c,"
-                          "pulsepressure, ureacreatinineratio, ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag"
-                          ") VALUES ("
-                          ":age, :gender, :systolicbp, :diastolicbp, :serumcreatinine, :bunlevels, :gfr, :acr,"
-                          ":serumelectrolytessodium, :serumelectrolytespotassium, :hemoglobinlevels, :hba1c,"
-                          ":pulsepressure, :ureacreatinineratio, :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag"
-                          ");"), row)
+        conn.execute(text(
+            "INSERT INTO user_inputs ("
+            "age, gender, systolicbp, diastolicbp, serumcreatinine, bunlevels, gfr, acr,"
+            "serumelectrolytessodium, serumelectrolytespotassium, hemoglobinlevels, hba1c,"
+            "pulsepressure, ureacreatinineratio, ckdstage, albuminuriacat, bp_risk, hyperkalemiaflag, anemiaflag"
+            ") VALUES ("
+            ":age, :gender, :systolicbp, :diastolicbp, :serumcreatinine, :bunlevels, :gfr, :acr,"
+            ":serumelectrolytessodium, :serumelectrolytespotassium, :hemoglobinlevels, :hba1c,"
+            ":pulsepressure, :ureacreatinineratio, :ckdstage, :albuminuriacat, :bp_risk, :hyperkalemiaflag, :anemiaflag"
+            ");"
+        ), row)
         rid = conn.execute(text("SELECT last_insert_rowid();")).scalar()
         return int(rid)
 
@@ -342,95 +342,101 @@ def _pos_index(model) -> int:
     except Exception:
         return 1
 
+def _to_1d_float(vec) -> np.ndarray:
+    """Coerce anything to a 1D float vector."""
+    arr = np.asarray(vec)
+    if arr.ndim == 0:
+        arr = arr.reshape(1)
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+    return arr.astype(float, copy=False)
+
+def _to_scalar_float(x, prefer_index: int | None = None) -> float:
+    """Coerce SHAP expected_value/base_values into a single float."""
+    arr = np.asarray(x)
+    if arr.size == 0:
+        return 0.0
+    if arr.ndim == 0:
+        return float(arr)
+    idx = 0 if prefer_index is None else min(prefer_index, arr.shape[0] - 1)
+    try:
+        return float(arr.reshape(-1)[idx])
+    except Exception:
+        return float(np.ravel(arr)[0])
+
 def _compute_shap_binary(model, X: pd.DataFrame) -> Tuple[np.ndarray, float]:
     """
-    Compute SHAP values for the first row, for the positive class.
-    Returns (vals_for_row, base_value).
-    Tries classic .shap_values() API first for stability across SHAP versions.
+    Compute SHAP values for the first row, positive class.
+    Returns (vals_for_row_1D_float, base_value_float).
     """
     pos = _pos_index(model)
 
-    # --- TreeExplainer path (RF/XGB/GBM) using classic API ---
+    # 1) Tree-based path (RF/XGB) – classic API
     try:
         tree_expl = shap.TreeExplainer(model)
         if hasattr(tree_expl, "shap_values"):
             sv = tree_expl.shap_values(X)
-            # sv can be [class0_array, class1_array] or a 2D array
             if isinstance(sv, list):
-                arr = np.asarray(sv[min(pos, len(sv)-1)])
-                vals = arr[0]  # first (only) row
+                arr = np.asarray(sv[min(pos, len(sv) - 1)])
+                vals = arr[0]                       # (n_features,)
             else:
                 arr = np.asarray(sv)
-                vals = arr[0]
-            base = tree_expl.expected_value
-            if isinstance(base, (list, tuple, np.ndarray)):
-                base_val = float(np.asarray(base)[min(pos, len(np.asarray(base))-1)])
-            else:
-                base_val = float(base)
-            return np.asarray(vals, dtype=float), base_val
+                vals = arr[0] if arr.ndim >= 2 else arr
+            base = getattr(tree_expl, "expected_value", 0.0)
+            base_val = _to_scalar_float(base, prefer_index=pos)
+            vals = _to_1d_float(vals)
+            return vals, base_val
     except Exception:
         pass
 
-    # --- LinearExplainer path (LogReg/SGD) classic API ---
+    # 2) Linear path (LogReg) – classic API
     try:
-        # For scikit-learn LogisticRegression, LinearExplainer works well
         lin_expl = shap.LinearExplainer(model, X, feature_dependence="independent")
         if hasattr(lin_expl, "shap_values"):
-            arr = np.asarray(lin_expl.shap_values(X))
-            # Returns (n_samples, n_features)
+            arr = np.asarray(lin_expl.shap_values(X))  # (n_samples, n_features)
             vals = arr[0]
-            base = lin_expl.expected_value
-            base_val = float(np.asarray(base).ravel()[0])
-            return np.asarray(vals, dtype=float), base_val
+            base = getattr(lin_expl, "expected_value", 0.0)
+            base_val = _to_scalar_float(base, prefer_index=pos)
+            vals = _to_1d_float(vals)
+            return vals, base_val
     except Exception:
         pass
 
-    # --- New Explanation API fallback ---
+    # 3) New Explanation API
     try:
         exp = shap.Explainer(model, X)
         res = exp(X.iloc[[0]])
         v = getattr(res, "values", None)
-        base_raw = getattr(res, "base_values", 0.0)
+        b = getattr(res, "base_values", 0.0)
 
-        # values may be array or list[class]
-        if isinstance(v, list):
-            arr = np.asarray(v[min(pos, len(v)-1)])
-            vals = arr[0]
+        if isinstance(v, list):               # list per class
+            arr = np.asarray(v[min(pos, len(v) - 1)])
+            vals = arr[0] if arr.ndim >= 2 else arr
         else:
             arr = np.asarray(v)
-            if arr.ndim == 3:      # (classes, samples, features)
-                vals = arr[min(pos, arr.shape[0]-1), 0, :]
-            elif arr.ndim == 2:    # (samples, features)
+            if arr.ndim == 3:                 # (classes, samples, features)
+                vals = arr[min(pos, arr.shape[0] - 1), 0, :]
+            elif arr.ndim == 2:               # (samples, features)
                 vals = arr[0]
-            elif arr.ndim == 1:    # (features,)
+            elif arr.ndim == 1:               # (features,)
                 vals = arr
             else:
-                vals = np.ravel(arr)
+                vals = arr.reshape(-1)
 
-        base_arr = np.asarray(base_raw)
-        if base_arr.ndim == 0:
-            base_val = float(base_arr)
-        elif base_arr.ndim == 1:
-            base_val = float(base_arr[min(pos, base_arr.shape[0]-1)])
-        elif base_arr.ndim == 2:
-            base_val = float(base_arr[min(pos, base_arr.shape[0]-1), 0])
-        else:
-            base_val = float(np.ravel(base_arr)[0])
-
-        return np.asarray(vals, dtype=float), float(base_val)
+        base_val = _to_scalar_float(b, prefer_index=pos)
+        vals = _to_1d_float(vals)
+        return vals, base_val
     except Exception:
         pass
 
-    # --- Last resort: use model importances/coeffs (not true SHAP, but unblocks UI) ---
+    # 4) Fallback – feature_importances_/coef_ (keeps UI alive)
     try:
         if hasattr(model, "feature_importances_"):
-            vals = np.asarray(model.feature_importances_, dtype=float)
-            base_val = 0.0
-            return vals, base_val
+            vals = _to_1d_float(getattr(model, "feature_importances_"))
+            return vals, 0.0
         if hasattr(model, "coef_"):
-            vals = np.asarray(model.coef_).ravel().astype(float)
-            base_val = 0.0
-            return vals, base_val
+            vals = _to_1d_float(getattr(model, "coef_"))
+            return vals, 0.0
     except Exception:
         pass
 
@@ -440,12 +446,16 @@ def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     X = features.copy()
     vals, base = _compute_shap_binary(model, X)
     feat_names = list(X.columns)
-    # Align in case some backends return less/more features (safety)
-    n = min(len(feat_names), len(vals))
+
+    # Align length defensively
+    n = min(len(feat_names), vals.size)
+    vals = vals[:n]
+
     shap_dict = {feat_names[i]: float(vals[i]) for i in range(n)}
     top = sorted(
         [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_dict.items()],
-        key=lambda d: d["impact"], reverse=True
+        key=lambda d: d["impact"],
+        reverse=True
     )[:k]
     return float(base), shap_dict, top
 
@@ -604,7 +614,5 @@ def last_inferences(limit: int = Query(10, ge=1, le=100)):
 # Local run
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Free port 8000 if something is holding it? Do nothing here;
-    # use the shell line I give you below to kill old uvicorns.
     import uvicorn
     uvicorn.run("api.app:app", host="0.0.0.0", port=8000, reload=True)
