@@ -7,8 +7,11 @@ import streamlit as st
 import pandas as pd
 
 # =========================
-# Config
+# Branding & Config
 # =========================
+APP_TITLE_HUMAN = "Kidney Health Radar"
+APP_REPO_URL    = "https://github.com/baheldeepti/CKDPredictor"
+
 # Prefer hosted API on Render; allow override via Secrets or env.
 API_URL_DEFAULT = "https://ckdpredictor.onrender.com"
 API_URL = (
@@ -39,10 +42,36 @@ LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL    = st.secrets.get("LLM_MODEL", "openrouter/auto")
 
 # Optional branding for OpenRouter headers
-APP_URL   = st.secrets.get("APP_URL", "https://github.com/baheldeepti/CKDPredictor")
-APP_TITLE = st.secrets.get("APP_TITLE", "CKD Predictor")
+APP_URL   = st.secrets.get("APP_URL", APP_REPO_URL)
+APP_TITLE = st.secrets.get("APP_TITLE", APP_TITLE_HUMAN)
 
-st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
+st.set_page_config(page_title=APP_TITLE_HUMAN, page_icon="🩺", layout="wide")
+
+# -------------------------
+# Light CSS lift
+# -------------------------
+STYLE = """
+<style>
+:root {
+  --brand:#2563eb; --ok:#16a34a; --warn:#f59e0b; --bad:#ef4444; --muted:#6b7280; --bg:#f8fafc;
+}
+html, body, [class^="css"]  {
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+}
+section.main > div { padding-top: 0.5rem !important; }
+h1, h2, h3 { letter-spacing: -0.01em; }
+.small-muted { color: var(--muted); font-size: 12px; }
+.badge { padding:2px 10px; border-radius:999px; font-weight:600; display:inline-block; }
+.card  { padding:14px; border-radius:12px; border:1px solid #e6e6e6; background:#fff; }
+hr     { border: none; border-top:1px solid #eee; margin: 0.5rem 0 1rem; }
+.stButton>button { border-radius:10px; border:1px solid rgba(0,0,0,0.08); }
+.stDownloadButton>button { border-radius:10px; }
+.block-info { font-size:13px; color:#334155; }
+.top-chip { font-size:12px; color:var(--muted); margin-top:-6px; }
+.tooltip { font-size:12px; color:#475569; }
+</style>
+"""
+st.markdown(STYLE, unsafe_allow_html=True)
 
 # =========================
 # Helpers
@@ -73,7 +102,6 @@ def _risk_badge(prob_ckd: float, thr: float) -> tuple[str, str, str]:
     # label, bg, color
     if prob_ckd >= thr:
         return "Above threshold", "#fee2e2", "#991b1b"
-    # friendly buckets
     if prob_ckd >= 0.33:
         return "Moderate risk", "#fef3c7", "#92400e"
     return "Lower risk", "#dcfce7", "#065f46"
@@ -82,21 +110,17 @@ def _result_card(prob_ckd: float, thr: float, model_used: str):
     label, bg, col = _risk_badge(prob_ckd, thr)
     st.markdown(
         f"""
-        <div style="padding:14px;border-radius:12px;border:1px solid #e6e6e6;">
+        <div class="card">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
             <div style="font-size:18px;font-weight:700;">{MODEL_KEYS.get(model_used, model_used)}</div>
-            <div style="font-size:14px;font-weight:700;">
-              <span style="padding:2px 8px;border-radius:999px;background:{bg};color:{col}">
-                {label}
-              </span>
-            </div>
+            <div class="badge" style="background:{bg};color:{col}">{label}</div>
           </div>
           <div style="display:flex;gap:24px;flex-wrap:wrap;">
             <div><strong>Probability of CKD</strong><br><span style="font-size:20px;">{prob_ckd:.3f}</span></div>
             <div><strong>Decision Threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
           </div>
-          <div style="margin-top:8px;color:#555;font-size:13px;">
-            A probability at or above the threshold is flagged as CKD by this model.
+          <div class="small-muted" style="margin-top:8px;">
+            A probability at or above the threshold is flagged for CKD follow-up by this model.
           </div>
         </div>
         """,
@@ -213,10 +237,10 @@ def _log(msg: str):
 # Sidebar: Connection & About
 # =========================
 with st.sidebar:
-    st.markdown("### 🔌 Backend")
-    api_input = st.text_input("API URL", value=st.session_state["api_url"], help="Override if running locally.")
+    st.markdown("### 🔌 Connection")
+    api_input = st.text_input("Backend API URL", value=st.session_state["api_url"], help="Override if running locally.")
     api_input = _normalize_api(api_input)
-    if st.button("Test connection"):
+    if st.button("Check API"):
         try:
             h = requests.get(f"{api_input}/health", params={"model":"rf"}, timeout=10).json()
             ok = h.get("status") == "ok"
@@ -228,20 +252,20 @@ with st.sidebar:
                 st.warning(h)
         except Exception as e:
             st.error(f"Failed: {e}")
-    st.caption(f"Using API: `{st.session_state['api_url']}`")
+    st.caption(f"Using: `{st.session_state['api_url']}`")
 
     st.markdown("---")
-    st.markdown("### ℹ️ Notes")
+    st.markdown("### ℹ️ About")
     st.caption(
-        "This tool estimates CKD risk from lab values and vitals. "
-        "It does **not** provide medical diagnosis. Always consult a clinician."
+        "Transparent CKD risk screening with model comparison and explanations. "
+        "This tool does **not** provide a medical diagnosis. Consult a clinician."
     )
 
 # =========================
 # Header + Controls
 # =========================
-st.title("🩺 CKD Predictor")
-st.caption("Single & batch predictions, **multi-model comparison**, SHAP explainability, DB metrics, and AI cohort insights.")
+st.title(f"🩺 {APP_TITLE_HUMAN}")
+st.caption("Quick, transparent CKD risk checks—single or CSV—plus explainers, logs, and AI summaries.")
 
 top_left, top_right = st.columns([3, 2])
 with top_left:
@@ -250,21 +274,21 @@ with top_left:
         "Models to compare",
         model_labels,
         default=[model_labels[1]],  # default RF
-        help="Pick one or more models. We'll compare outputs side-by-side."
+        help="Pick one or more models. We’ll compare outputs side-by-side."
     )
     selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["rf"]
 
     st.markdown(
-        "<div style='font-size:12px;color:#666;margin-top:-6px'>"
-        "<b>Rebuild models</b> retrains on the server. "
-        "<b>Reload models</b> clears the API cache to pick up fresh artifacts."
+        "<div class='top-chip'>"
+        "<b>Train models</b> retrains on the server • "
+        "<b>Reload models</b> refreshes cached artifacts"
         "</div>",
         unsafe_allow_html=True
     )
 
     cA, cB, cC = st.columns([1, 1, 1])
     with cA:
-        if st.button("Health", use_container_width=True):
+        if st.button("API health", use_container_width=True):
             try:
                 h = requests.get(f"{st.session_state['api_url']}/health", params={"model": selected_models[0]}, timeout=10).json()
                 if h.get("status") == "ok":
@@ -278,16 +302,16 @@ with top_left:
                 _log(f"Health ERROR: {e}")
 
     with cB:
-        if st.button("Rebuild models", use_container_width=True):
+        if st.button("Train models", use_container_width=True):
             try:
                 r = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
                 if r.status_code in (200, 202):
-                    st.success("Retrain started", icon="🛠️")
+                    st.success("Training started", icon="🛠️")
                 else:
-                    st.info(f"Retrain returned {r.status_code}", icon="ℹ️")
+                    st.info(f"Request returned {r.status_code}", icon="ℹ️")
                 _log(f"Retrain response: {getattr(r, 'text', '')[:200]}")
             except Exception as e:
-                st.error("Failed to start retrain", icon="🛑")
+                st.error("Failed to start training", icon="🛑")
                 _log(f"Retrain ERROR: {e}")
 
     with cC:
@@ -313,17 +337,17 @@ st.divider()
 # Tabs
 # =========================
 tab_single, tab_batch, tab_metrics, tab_advice = st.tabs(
-    ["Single prediction (compare models)",
-     "Batch predictions (compare models)",
-     "Metrics",
-     "Recommendations (alpha)"]
+    ["Single check (compare models)",
+     "Bulk check (CSV)",
+     "Service & logs",
+     "AI summary & next steps"]
 )
 
 # =========================
 # Single prediction
 # =========================
 with tab_single:
-    st.markdown("Fill the form, then **Predict with selected models**. Compare outputs and explanations.")
+    st.markdown("Enter values and click **Predict**. See model outputs and top drivers.")
 
     # Prefill / Reset controls
     c1, c2, c3 = st.columns([1,1,2])
@@ -359,14 +383,14 @@ with tab_single:
             (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults()
 
         with col1:
-            age = st.number_input("Age", 0, 120, age_d)
-            gender = st.selectbox("Gender (0=female, 1=male)", [0, 1], index=gender_d)
+            age = st.number_input("Age (years)", 0, 120, age_d)
+            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_d)
             systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d)
             diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, dbp_d)
-            serumcreatinine = st.number_input("Serum Creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1)
+            serumcreatinine = st.number_input("Serum creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1)
             bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, bun_d, step=0.5)
             gfr = st.number_input("GFR (mL/min/1.73m²)", 1.0, 200.0, gfr_d, step=0.5)
-            acr = st.number_input("ACR (mg/g)", 0.0, 5000.0, acr_d, step=1.0)
+            acr = st.number_input("Albumin/creatinine ratio, ACR (mg/g)", 0.0, 5000.0, acr_d, step=1.0)
         with col2:
             serumelectrolytessodium = st.number_input("Sodium (mEq/L)", 110.0, 170.0, na_d, step=0.5)
             serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, k_d, step=0.1)
@@ -381,9 +405,9 @@ with tab_single:
         ureacreatinineratio = float(bunlevels) / (float(serumcreatinine) + 1e-6)
 
         st.caption(
-            f"Derived → PulsePressure={pulsepressure} • Urea/Creatinine={ureacreatinineratio:.2f} • "
-            f"Flags: BP={bp_risk}, HK={hyperkalemiaflag}, Anemia={anemiaflag} • "
-            f"Stage={ckdstage}, Albuminuria={albuminuriacat}"
+            f"Derived → Pulse pressure={pulsepressure} • Urea/Creatinine={ureacreatinineratio:.2f} • "
+            f"Flags: High BP={bp_risk}, Hyperkalemia={hyperkalemiaflag}, Anemia={anemiaflag} • "
+            f"CKD stage={ckdstage}, Albuminuria category={albuminuriacat}"
         )
 
         do_predict = st.form_submit_button("Predict with selected models")
@@ -416,14 +440,14 @@ with tab_single:
                     _result_card(float(res.get("prob_ckd", 0.0)),
                                  float(res.get("threshold_used", 0.5)),
                                  res.get("model_used", m))
-                # Friendly summary for non-tech users
                 with cols[idx]:
                     prob = float(res.get("prob_ckd", 0.0))
                     thr  = float(res.get("threshold_used", 0.5))
+                    st.markdown("**Plain-English result**")
                     if prob >= thr:
-                        st.markdown("**Result:** This model would flag for CKD follow-up.")
+                        st.markdown("This model would **flag** for CKD **follow-up**.")
                     else:
-                        st.markdown("**Result:** This model would not flag for CKD at this time.")
+                        st.markdown("This model would **not** flag for CKD at this time.")
             except requests.HTTPError as e:
                 with cols[idx]:
                     st.error(f"{MODEL_KEYS.get(m,m)} failed")
@@ -436,13 +460,14 @@ with tab_single:
                 _log(f"Single predict ERROR ({m}): {e}")
 
         # Explainability per selected model
-        st.markdown("#### Explain prediction (top drivers)")
+        st.markdown("#### Why did the model think that? (Top drivers)")
+        st.caption("Higher bars = stronger influence on the decision for this case.")
         ecols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
             if m not in st.session_state["last_pred_results"]:
                 continue
             with ecols[idx]:
-                with st.spinner(f"{MODEL_KEYS.get(m,m)} — SHAP"):
+                with st.spinner(f"{MODEL_KEYS.get(m,m)} — computing SHAP"):
                     try:
                         er = requests.post(f"{st.session_state['api_url']}/explain", params={"model": m}, json=payload, timeout=60)
                         if er.status_code == 404:
@@ -486,7 +511,7 @@ with tab_single:
 # Batch predictions
 # =========================
 with tab_batch:
-    st.markdown("Upload a CSV, run batch predictions across **all selected models**, and compare.")
+    st.markdown("Upload a CSV, run through selected models, and compare results.")
     left, right = st.columns([2, 1])
     with left:
         st.caption("Required columns:")
@@ -494,7 +519,7 @@ with tab_batch:
     with right:
         template_blank = pd.DataFrame(columns=FEATURE_COLUMNS)
         sample5 = sample_records_df()
-        st.download_button("Blank Template CSV",
+        st.download_button("Blank template CSV",
                            data=template_blank.to_csv(index=False).encode("utf-8"),
                            file_name="ckd_template_blank.csv", mime="text/csv")
         st.download_button("Sample CSV (5 rows)",
@@ -502,7 +527,7 @@ with tab_batch:
                            file_name="ckd_sample_5rows.csv", mime="text/csv")
 
     file = st.file_uploader("Upload CSV", type=["csv"])
-    retrain_after_batch = st.checkbox("Retrain after batch", value=False)
+    retrain_after_batch = st.checkbox("Start training after batch (optional)", value=False)
 
     if file:
         try:
@@ -513,7 +538,7 @@ with tab_batch:
             else:
                 st.dataframe(df.head())
 
-                if st.button("Run Batch with selected models"):
+                if st.button("Run batch with selected models"):
                     st.session_state["batch_preds"] = {}
                     summary_rows = []
                     for m in selected_models:
@@ -580,26 +605,27 @@ with tab_batch:
                             try:
                                 rr = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
                                 if rr.status_code in (200, 202):
-                                    st.success("Retraining started. Check Health above.")
+                                    st.success("Training started. Check API health above.")
                                     _log("Retrain triggered after batch.")
                                 else:
-                                    st.info(f"Retrain request sent ({rr.status_code}).")
+                                    st.info(f"Training request sent ({rr.status_code}).")
                                     _log(f"Retrain response after batch: {getattr(rr,'text','')[:200]}")
                             except Exception as e:
-                                st.error("Retrain call failed.")
+                                st.error("Training call failed.")
                                 st.caption(str(e))
                                 _log(f"Retrain after batch ERROR: {e}")
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
 
     # Cohort insights (AI)
-    st.markdown("#### Cohort insights (AI)")
+    st.markdown("#### AI cohort summary")
+    st.caption("Turns batch results into a short clinical overview. No medication dosing.")
     available_models = list(st.session_state.get("batch_preds", {}).keys())
     if not available_models:
         st.info("Run a batch first to enable insights.")
     else:
         insights_model = st.selectbox(
-            "Choose model output to summarize",
+            "Summarize which model’s output?",
             [MODEL_KEYS.get(m, m) for m in available_models],
             index=0
         )
@@ -647,10 +673,10 @@ Task (format output as short sections with bullets):
             insights_html = nl2br(st.session_state["batch_insights"])
             st.markdown(
                 f"""
-                <div style="border:1px solid #e6e6e6;border-radius:12px;padding:16px;background:#fafafa">
+                <div class="card">
                   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
                     <div style="font-weight:700">Cohort Insights — {MODEL_KEYS.get(chosen_m, chosen_m)}</div>
-                    <div style="font-size:12px;color:#666">Positive rate {pos_rate:.1%} • Avg Prob_CKD {avg_prob:.3f} • Rows {len(preds)}</div>
+                    <div class="small-muted">Positive rate {pos_rate:.1%} • Avg Prob_CKD {avg_prob:.3f} • Rows {len(preds)}</div>
                   </div>
                   <div style="line-height:1.55">{insights_html}</div>
                 </div>
@@ -668,8 +694,8 @@ Task (format output as short sections with bullets):
 # Metrics
 # =========================
 with tab_metrics:
-    st.markdown("Monitor service health, recent inferences (requires DB logging), and last retrain status.")
-    auto = st.checkbox("Auto-refresh every 10s", value=False)
+    st.markdown("Keep an eye on service health, recent inferences, and training reports.")
+    auto = st.checkbox("Auto-refresh every 10 seconds", value=False)
     if auto:
         st.markdown("<script>setTimeout(() => window.location.reload(), 10000);</script>", unsafe_allow_html=True)
 
@@ -695,27 +721,27 @@ with tab_metrics:
             if rows:
                 st.dataframe(pd.DataFrame(rows))
             else:
-                st.info("No inferences yet — run Single/Batch predictions.")
+                st.info("No inferences yet — run Single or Batch.")
         except Exception as e:
             st.error(f"Fetch failed: {e}")
 
-    st.subheader("Model status (last retrain)")
+    st.subheader("Training status (last retrain)")
     try:
         rr = requests.get(f"{st.session_state['api_url']}/metrics/retrain_report", timeout=10)
         if rr.status_code == 200:
             st.json(rr.json())
         else:
-            st.info("No retrain report found. Click **Rebuild models** at top, then **Reload models**.")
+            st.info("No retrain report found. Click **Train models**, then **Reload models**.")
     except Exception as e:
         st.error(f"Report fetch failed: {e}")
 
 # =========================
-# Recommendations (alpha)
+# AI summary & next steps
 # =========================
 with tab_advice:
     st.markdown(
-        "AI-assisted recommendations for the **last single prediction**. "
-        "Interprets stage, albuminuria, and flags. No medication dosing. "
+        "AI-assisted **next steps** for the last single prediction. "
+        "Considers stage, albuminuria, and flags. No medication dosing. "
         "_This is not medical advice._"
     )
 
@@ -762,16 +788,16 @@ Constraints:
 - Add: 'This is not medical advice; consult your clinician.'
 """
 
-        if st.button("Generate recommendations"):
+        if st.button("Generate AI next steps"):
             text = call_llm(system_prompt, user_prompt)
             if text:
                 text_html = nl2br(text)
                 st.markdown(
                     f"""
-                    <div style="border:1px solid #e6e6e6;border-radius:12px;padding:16px;background:#fafafa">
+                    <div class="card">
                       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                        <div style="font-weight:700">Recommendations — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
-                        <div style="font-size:12px;color:#666">Prob_CKD {prob_ckd:.3f}</div>
+                        <div style="font-weight:700">AI next steps — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
+                        <div class="small-muted">Prob_CKD {prob_ckd:.3f}</div>
                       </div>
                       <div style="line-height:1.55">{text_html}</div>
                     </div>
@@ -779,7 +805,7 @@ Constraints:
                     unsafe_allow_html=True
                 )
                 st.download_button(
-                    "Download recommendations (.txt)",
+                    "Download next steps (.txt)",
                     data=text.encode("utf-8"),
                     file_name="ckd_recommendations.txt",
                     mime="text/plain"
