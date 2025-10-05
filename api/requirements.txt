@@ -10,3 +10,6 @@ xgboost==2.0.3
 SQLAlchemy==2.0.31
 psycopg2-binary==2.9.9
 python-dotenv==1.0.1
+shap==0.44.1
+numba==0.59.1
+llvmlite==0.42.0
