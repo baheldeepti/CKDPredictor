@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, text
 # -----------------------------------------------------------------------------
 # App (instantiate FIRST) + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="0.9.0")
+app = FastAPI(title="CKD Predictor API", version="0.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -42,15 +42,13 @@ def root():
 # Configuration (paths & registry)
 # -----------------------------------------------------------------------------
 
-# Base paths
-BASE_DIR = Path(__file__).resolve().parent                 # .../api
-MODEL_DIR = Path(os.getenv("MODEL_DIR") or (BASE_DIR.parent / "models"))  # .../<repo_root>/models
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_DIR = Path(os.getenv("MODEL_DIR") or (BASE_DIR.parent / "models"))
 
-# Optional: log where we're loading models from
 print(f"[boot] MODEL_DIR={MODEL_DIR.resolve()} exists={MODEL_DIR.exists()}")
 
-# If your *older* XGBoost model (pre-ml/99_retrain.py) exposed proba[:,1] as P(non-CKD),
-# set this True. If using models from ml/99_retrain.py (standard class1=CKD), keep False.
+# If your *older* XGB model (pre-ml/99_retrain.py) exposed proba[:,1] as P(non-CKD), set True.
+# If using models from ml/99_retrain.py (standard class1=CKD), keep False.
 LEGACY_XGB_FLIPPED: bool = False
 
 REGISTRY: Dict[str, Dict[str, object]] = {
@@ -72,27 +70,26 @@ REGISTRY: Dict[str, Dict[str, object]] = {
 }
 
 FEATURE_COLS: List[str] = [
-    "age", "gender",
-    "systolicbp", "diastolicbp",
-    "serumcreatinine", "bunlevels",
-    "gfr", "acr",
-    "serumelectrolytessodium", "serumelectrolytespotassium",
-    "hemoglobinlevels", "hba1c",
-    "pulsepressure", "ureacreatinineratio",
-    "ckdstage", "albuminuriacat",
-    "bp_risk", "hyperkalemiaflag", "anemiaflag",
+    "age","gender",
+    "systolicbp","diastolicbp",
+    "serumcreatinine","bunlevels",
+    "gfr","acr",
+    "serumelectrolytessodium","serumelectrolytespotassium",
+    "hemoglobinlevels","hba1c",
+    "pulsepressure","ureacreatinineratio",
+    "ckdstage","albuminuriacat",
+    "bp_risk","hyperkalemiaflag","anemiaflag",
 ]
 
 # Database (optional; used for logging)
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 
-# Optional lightweight admin protection (set ADMIN_TOKEN env var to enable)
+# Optional lightweight admin protection
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
-
 def _check_admin(token: str | None):
     if not ADMIN_TOKEN:
-        return  # no protection configured
+        return
     if token != ADMIN_TOKEN:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -122,7 +119,6 @@ class PatientFeatures(BaseModel):
     anemiaflag: int
 
 class PredictResponse(BaseModel):
-    # Silence: "Field 'model_used' conflicts with protected namespace 'model_'"
     model_config = ConfigDict(protected_namespaces=())
     prediction: int = Field(description="0 = Non-CKD, 1 = CKD")
     prob_ckd: float
@@ -184,15 +180,14 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
 
     proba1 = mdl.predict_proba(df)[:, 1]  # standard: P(CKD)
     if flip:
-        # Legacy XGB path: proba1 is actually P(Non-CKD)
         prob_non_ckd = proba1
         prob_ckd = 1.0 - proba1
         pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 means "Non-CKD"
-        prediction = np.where(pred_class0 == 1, 0, 1)    # convert to 0/1 in original labels
+        prediction = np.where(pred_class0 == 1, 0, 1)
     else:
         prob_ckd = proba1
         prob_non_ckd = 1.0 - proba1
-        prediction = (prob_ckd >= thr).astype(int)       # 1 means CKD
+        prediction = (prob_ckd >= thr).astype(int)
 
     out = pd.DataFrame({
         "prediction": prediction.astype(int),
@@ -243,8 +238,67 @@ def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: 
     })
 
 # -----------------------------------------------------------------------------
-# SHAP helper (robust)
+# SHAP helper (hardened for RF + LogReg + XGB)
 # -----------------------------------------------------------------------------
+
+def _positive_class_index(model) -> int:
+    try:
+        classes = getattr(model, "classes_", None)
+        if classes is None:
+            return 1
+        classes = list(classes)
+        return classes.index(1) if 1 in classes else (np.argmax(classes))
+    except Exception:
+        return 1
+
+def _extract_shap_values(sv, model) -> Tuple[np.ndarray, float]:
+    """
+    Robustly extract (values_for_positive_class, base_value) from a shap.Explanation
+    across SHAP versions and model types.
+    """
+    # values may be array, list of arrays, or a 3D (classes, samples, features)
+    v = getattr(sv, "values", None)
+    if v is None:
+        # Older API: sv is array-like
+        v = sv[0].values
+    vals = np.array(v)
+
+    # base values
+    base_raw = getattr(sv, "base_values", None)
+    if base_raw is None:
+        base_raw = 0.0
+    base_arr = np.array(base_raw)
+
+    if vals.ndim == 1:
+        vals_out = vals
+    elif vals.ndim == 2:
+        # (samples, features)
+        vals_out = vals[0]
+    elif vals.ndim == 3:
+        # (classes, samples, features)
+        ci = _positive_class_index(model)
+        vals_out = vals[ci, 0, :]
+    else:
+        raise ValueError(f"Unexpected SHAP values shape: {vals.shape}")
+
+    # base handling: pick positive class if classwise, else first
+    if base_arr.ndim == 0:
+        base = float(base_arr)
+    elif base_arr.ndim == 1:
+        # could be (samples,) or (classes,)
+        if len(base_arr) == 2 and hasattr(model, "classes_"):
+            ci = _positive_class_index(model)
+            base = float(base_arr[ci])
+        else:
+            base = float(base_arr[0])
+    elif base_arr.ndim == 2:
+        # (classes, samples)
+        ci = _positive_class_index(model)
+        base = float(base_arr[ci, 0])
+    else:
+        base = float(np.ravel(base_arr)[0])
+
+    return vals_out, base
 
 def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     """
@@ -254,25 +308,23 @@ def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     """
     X = features.copy()
 
-    # Try specialized explainers first for stability & speed
+    # Choose explainer
     explainer = None
     try:
-        # XGB / RF (tree-based)
-        from xgboost import XGBClassifier  # noqa: F401
-        is_tree = (
-            hasattr(model, "feature_importances_")
-            or model.__class__.__name__.lower().startswith(("xgb", "randomforest", "gradientboost"))
-        )
+        # Tree models: RandomForest*, XGB*, GradientBoost*
+        name = model.__class__.__name__.lower()
+        is_tree = ("forest" in name) or ("xgb" in name) or ("gradientboost" in name) or hasattr(model, "feature_importances_")
         if is_tree:
-            explainer = shap.TreeExplainer(model, feature_names=X.columns.tolist())
+            # Use probability space for classifiers to avoid log-odds confusion
+            explainer = shap.TreeExplainer(model, data=X, model_output="probability")
     except Exception:
         explainer = None
 
     if explainer is None:
         try:
-            # Linear models (logreg, etc.)
-            from sklearn.linear_model import LogisticRegression  # noqa: F401
-            if model.__class__.__name__.lower().startswith(("logisticregression", "sgdclassifier", "linearsvc", "linear")):
+            # Linear models (LogisticRegression/SGD/Linear*)
+            name = model.__class__.__name__.lower()
+            if name.startswith(("logisticregression", "sgdclassifier", "linearsvc", "linear")):
                 mask = shap.maskers.Independent(X)
                 explainer = shap.LinearExplainer(model, mask)
         except Exception:
@@ -281,17 +333,13 @@ def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
     # Generic fallback
     if explainer is None:
         try:
-            explainer = shap.Explainer(model, X, feature_names=X.columns.tolist())
+            explainer = shap.Explainer(model, X)
         except Exception:
-            # Last resort: independent masker + generic
             mask = shap.maskers.Independent(X)
             explainer = shap.Explainer(model, mask)
 
-    # Compute SHAP values for the first row only (what the UI needs)
     sv = explainer(X.iloc[[0]])
-    # sv.values shape: (1, n_features); sv.base_values shape: (1,) or scalar
-    vals = sv.values[0] if hasattr(sv, "values") else sv[0].values
-    base = float(sv.base_values[0] if getattr(sv, "base_values", None) is not None else 0.0)
+    vals, base = _extract_shap_values(sv, model)
 
     feat_names = list(X.columns)
     shap_dict = {feat_names[i]: float(vals[i]) for i in range(len(feat_names))}
@@ -335,7 +383,6 @@ def predict(
                 input_id = _save_user_input(conn, item.dict())
                 _save_inference(conn, input_id, res["model_used"], res["threshold_used"], res)
         except Exception as e:
-            # don't break inference if logging fails
             print(f"[warn] logging failed: {e}")
 
     return res
@@ -376,7 +423,6 @@ def explain(
     }
     """
     try:
-        # Build single-row DataFrame in correct column order
         df_in = pd.DataFrame([item.dict()])
         for c in FEATURE_COLS:
             if c not in df_in.columns:
@@ -384,8 +430,6 @@ def explain(
         X = df_in[FEATURE_COLS].copy()
 
         mdl, _, _ = get_model_and_thr(model)
-
-        # SHAP
         base, shap_values, top = _shap_top_k(X, mdl, k=6)
         return {
             "base_value": base,
@@ -395,25 +439,19 @@ def explain(
     except HTTPException:
         raise
     except Exception as e:
-        # Print full traceback to the API log; return brief error to client
+        # Logs full traceback server-side; short message to client
         print("[/explain] error:", e)
         print(traceback.format_exc())
         return JSONResponse(
             status_code=500,
-            content={"detail": f"explain_failed: {str(e)}"}
+            content={"detail": f"explain_failed: {str(e)}", "model": model}
         )
 
 # === Retrain / Reload =======================================================
 
 def _run_retrain_pipeline():
-    """
-    Runs the unified retraining script, then clears in-memory cache so the
-    next request serves the newly written artifacts.
-    """
     try:
-        # This should write ./models/* and models/retrain_report.json
         subprocess.run([sys.executable, "ml/99_retrain.py"], check=True)
-        # After artifacts are updated, clear cache to pick them up
         global _cache
         _cache.clear()
         print("[retrain] completed; cache cleared.")
@@ -426,11 +464,6 @@ def admin_retrain(
     sync: bool = Query(False, description="Run synchronously (blocks request)"),
     x_admin_token: str | None = Header(None),
 ):
-    """
-    Kicks off retraining. By default runs in the background and returns immediately.
-    Use sync=true to block until finished (not recommended for UI).
-    If ADMIN_TOKEN env is set, pass header: X-Admin-Token: <token>
-    """
     _check_admin(x_admin_token)
     if sync:
         _run_retrain_pipeline()
@@ -441,12 +474,44 @@ def admin_retrain(
 
 @app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
 def admin_reload(x_admin_token: str | None = Header(None)):
-    """
-    Clears the in-memory model cache so the next call reloads fresh artifacts.
-    Use this after CI retraining updates files in ./models.
-    If ADMIN_TOKEN env is set, pass header: X-Admin-Token: <token>
-    """
     _check_admin(x_admin_token)
     global _cache
     _cache.clear()
     return  # 204 No Content
+
+# === Metrics ================================================================
+
+@app.get("/metrics/retrain_report")
+def retrain_report():
+    """
+    Returns last retraining summary if models/retrain_report.json exists.
+    """
+    path = MODEL_DIR / "retrain_report.json"
+    if not path.exists():
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "retrain_report.json not found"}
+        )
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"detail": f"failed to read report: {e}"})
+
+@app.get("/metrics/last_inferences")
+def last_inferences(limit: int = Query(10, ge=1, le=100)):
+    """
+    Returns recent inference rows (privacy-preserving), requires DATABASE_URL.
+    """
+    if engine is None:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "DATABASE_URL not configured on server; cannot read inference_log."},
+        )
+    with engine.begin() as c:
+        rows = c.execute(text("""
+            SELECT il.created_at, il.model_used, il.prediction, il.prob_ckd, il.prob_non_ckd, il.threshold_used
+            FROM inference_log il
+            ORDER BY il.created_at DESC
+            LIMIT :limit
+        """), {"limit": limit}).mappings().all()
+    return {"rows": [dict(r) for r in rows]}
