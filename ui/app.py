@@ -9,7 +9,7 @@ import pandas as pd
 # =========================
 # Config
 # =========================
-# Prefer your Render API; allow override via Secrets or env.
+# Prefer hosted API on Render; allow override via Secrets or env.
 API_URL_DEFAULT = "https://ckdpredictor.onrender.com"
 API_URL = (
     st.secrets.get("API_URL")
@@ -47,6 +47,11 @@ st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
 # =========================
 # Helpers
 # =========================
+def _normalize_api(url: str) -> str:
+    if not url:
+        return API_URL_DEFAULT
+    return url.rstrip("/")
+
 def nl2br(s: str) -> str:
     try:
         return s.replace("\n", "<br/>")
@@ -64,9 +69,17 @@ def sanitize_payload(d: dict) -> dict:
         out[k] = float(v)
     return out
 
-def _result_card(label: str, prob_ckd: float, thr: float, model_used: str):
-    bg  = "#fee2e2" if label == "CKD" else "#dcfce7"
-    col = "#991b1b" if label == "CKD" else "#065f46"
+def _risk_badge(prob_ckd: float, thr: float) -> tuple[str, str, str]:
+    # label, bg, color
+    if prob_ckd >= thr:
+        return "Above threshold", "#fee2e2", "#991b1b"
+    # friendly buckets
+    if prob_ckd >= 0.33:
+        return "Moderate risk", "#fef3c7", "#92400e"
+    return "Lower risk", "#dcfce7", "#065f46"
+
+def _result_card(prob_ckd: float, thr: float, model_used: str):
+    label, bg, col = _risk_badge(prob_ckd, thr)
     st.markdown(
         f"""
         <div style="padding:14px;border-radius:12px;border:1px solid #e6e6e6;">
@@ -79,8 +92,11 @@ def _result_card(label: str, prob_ckd: float, thr: float, model_used: str):
             </div>
           </div>
           <div style="display:flex;gap:24px;flex-wrap:wrap;">
-            <div><strong>Prob CKD</strong><br><span style="font-size:20px;">{prob_ckd:.3f}</span></div>
-            <div><strong>Threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+            <div><strong>Probability of CKD</strong><br><span style="font-size:20px;">{prob_ckd:.3f}</span></div>
+            <div><strong>Decision Threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+          </div>
+          <div style="margin-top:8px;color:#555;font-size:13px;">
+            A probability at or above the threshold is flagged as CKD by this model.
           </div>
         </div>
         """,
@@ -120,7 +136,7 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
 
 def call_llm(system_prompt: str, user_prompt: str):
     if LLM_PROVIDER.lower() == "openrouter":
-        with st.spinner("Generating cohort insights…"):
+        with st.spinner("Generating insights…"):
             return _call_openrouter_chat(system_prompt, user_prompt)
     if not LLM_API_KEY:
         st.warning("No LLM API key configured. Add LLM_API_KEY in `.streamlit/secrets.toml`.")
@@ -131,7 +147,7 @@ def call_llm(system_prompt: str, user_prompt: str):
         st.error("Package `openai` missing. Install with: `pip install openai`")
         return None
     try:
-        with st.spinner("Generating cohort insights…"):
+        with st.spinner("Generating insights…"):
             client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
@@ -187,9 +203,39 @@ if "batch_insights" not in st.session_state:
     st.session_state["batch_insights"] = None
 if "activity_log" not in st.session_state:
     st.session_state["activity_log"] = []
+if "api_url" not in st.session_state:
+    st.session_state["api_url"] = _normalize_api(API_URL)
 
 def _log(msg: str):
     st.session_state["activity_log"].append(msg)
+
+# =========================
+# Sidebar: Connection & About
+# =========================
+with st.sidebar:
+    st.markdown("### 🔌 Backend")
+    api_input = st.text_input("API URL", value=st.session_state["api_url"], help="Override if running locally.")
+    api_input = _normalize_api(api_input)
+    if st.button("Test connection"):
+        try:
+            h = requests.get(f"{api_input}/health", params={"model":"rf"}, timeout=10).json()
+            ok = h.get("status") == "ok"
+            db = "connected" if h.get("db_connected") else "not connected"
+            if ok:
+                st.success(f"OK • DB {db} • {h.get('db_backend','?')}")
+                st.session_state["api_url"] = api_input
+            else:
+                st.warning(h)
+        except Exception as e:
+            st.error(f"Failed: {e}")
+    st.caption(f"Using API: `{st.session_state['api_url']}`")
+
+    st.markdown("---")
+    st.markdown("### ℹ️ Notes")
+    st.caption(
+        "This tool estimates CKD risk from lab values and vitals. "
+        "It does **not** provide medical diagnosis. Always consult a clinician."
+    )
 
 # =========================
 # Header + Controls
@@ -201,7 +247,7 @@ top_left, top_right = st.columns([3, 2])
 with top_left:
     model_labels = [label for label, _ in MODEL_CHOICES]
     picked_labels = st.multiselect(
-        "Select models to use",
+        "Models to compare",
         model_labels,
         default=[model_labels[1]],  # default RF
         help="Pick one or more models. We'll compare outputs side-by-side."
@@ -220,7 +266,7 @@ with top_left:
     with cA:
         if st.button("Health", use_container_width=True):
             try:
-                h = requests.get(f"{API_URL}/health", params={"model": selected_models[0]}, timeout=10).json()
+                h = requests.get(f"{st.session_state['api_url']}/health", params={"model": selected_models[0]}, timeout=10).json()
                 if h.get("status") == "ok":
                     st.success("Healthy", icon="✅")
                     _log(f"Health OK • model={h.get('model')} thr={h.get('threshold')} db={h.get('db_backend')}")
@@ -234,7 +280,7 @@ with top_left:
     with cB:
         if st.button("Rebuild models", use_container_width=True):
             try:
-                r = requests.post(f"{API_URL}/admin/retrain", timeout=10)
+                r = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
                 if r.status_code in (200, 202):
                     st.success("Retrain started", icon="🛠️")
                 else:
@@ -247,7 +293,7 @@ with top_left:
     with cC:
         if st.button("Reload models", use_container_width=True):
             try:
-                _ = requests.post(f"{API_URL}/admin/reload", timeout=20)
+                _ = requests.post(f"{st.session_state['api_url']}/admin/reload", timeout=20)
                 st.success("Reloaded", icon="🔄")
                 _log("Model cache reloaded.")
             except Exception as e:
@@ -278,22 +324,54 @@ tab_single, tab_batch, tab_metrics, tab_advice = st.tabs(
 # =========================
 with tab_single:
     st.markdown("Fill the form, then **Predict with selected models**. Compare outputs and explanations.")
+
+    # Prefill / Reset controls
+    c1, c2, c3 = st.columns([1,1,2])
+    with c1:
+        sample_idx = st.selectbox("Prefill sample", [1,2,3,4,5], index=1)
+    with c2:
+        do_prefill = st.button("Use sample")
+    with c3:
+        do_reset = st.button("Reset form")
+
+    def _defaults(si=None):
+        df = sample_records_df()
+        if si is not None:
+            row = df.iloc[si-1].to_dict()
+            return (
+                int(row["age"]), int(row["gender"]),
+                int(row["systolicbp"]), int(row["diastolicbp"]),
+                float(row["serumcreatinine"]), float(row["bunlevels"]),
+                float(row["gfr"]), float(row["acr"]),
+                float(row["serumelectrolytessodium"]), float(row["serumelectrolytespotassium"]),
+                float(row["hemoglobinlevels"]), float(row["hba1c"])
+            )
+        return (60, 1, 140, 85, 2.0, 28.0, 55.0, 120.0, 138.0, 4.8, 12.5, 6.8)
+
+    if do_reset:
+        st.experimental_rerun()
+
     with st.form("predict_form", border=True):
         col1, col2 = st.columns(2)
+        if do_prefill:
+            (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults(sample_idx)
+        else:
+            (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults()
+
         with col1:
-            age = st.number_input("Age", 0, 120, 60)
-            gender = st.selectbox("Gender (0=female, 1=male)", [0, 1], index=1)
-            systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, 140)
-            diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, 85)
-            serumcreatinine = st.number_input("Serum Creatinine (mg/dL)", 0.2, 15.0, 2.0, step=0.1)
-            bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, 28.0, step=0.5)
-            gfr = st.number_input("GFR (mL/min/1.73m²)", 1.0, 200.0, 55.0, step=0.5)
-            acr = st.number_input("ACR (mg/g)", 0.0, 5000.0, 120.0, step=1.0)
+            age = st.number_input("Age", 0, 120, age_d)
+            gender = st.selectbox("Gender (0=female, 1=male)", [0, 1], index=gender_d)
+            systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d)
+            diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, dbp_d)
+            serumcreatinine = st.number_input("Serum Creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1)
+            bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, bun_d, step=0.5)
+            gfr = st.number_input("GFR (mL/min/1.73m²)", 1.0, 200.0, gfr_d, step=0.5)
+            acr = st.number_input("ACR (mg/g)", 0.0, 5000.0, acr_d, step=1.0)
         with col2:
-            serumelectrolytessodium = st.number_input("Sodium (mEq/L)", 110.0, 170.0, 138.0, step=0.5)
-            serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, 4.8, step=0.1)
-            hemoglobinlevels = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, 12.5, step=0.1)
-            hba1c = st.number_input("HbA1c (%)", 3.5, 15.0, 6.8, step=0.1)
+            serumelectrolytessodium = st.number_input("Sodium (mEq/L)", 110.0, 170.0, na_d, step=0.5)
+            serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, k_d, step=0.1)
+            hemoglobinlevels = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, hb_d, step=0.1)
+            hba1c = st.number_input("HbA1c (%)", 3.5, 15.0, a1c_d, step=0.1)
 
             bp_risk, hyperkalemiaflag, anemiaflag, ckdstage, albuminuriacat = derive_flags_and_bins(
                 systolicbp, diastolicbp, serumelectrolytespotassium, hemoglobinlevels, gfr, acr
@@ -324,20 +402,28 @@ with tab_single:
             "bp_risk": bp_risk, "hyperkalemiaflag": hyperkalemiaflag, "anemiaflag": anemiaflag
         }
         payload = sanitize_payload(payload)
-
         st.session_state["last_pred_payload"] = payload
         st.session_state["last_pred_results"] = {}
 
         cols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
             try:
-                r = requests.post(f"{API_URL}/predict", params={"model": m}, json=payload, timeout=20)
+                r = requests.post(f"{st.session_state['api_url']}/predict", params={"model": m}, json=payload, timeout=20)
                 r.raise_for_status()
                 res = r.json()
                 st.session_state["last_pred_results"][m] = res
-                label = "CKD" if res.get("prediction", 1) == 1 else "Non-CKD"
                 with cols[idx]:
-                    _result_card(label, float(res.get("prob_ckd", 0.0)), float(res.get("threshold_used", 0.5)), res.get("model_used", m))
+                    _result_card(float(res.get("prob_ckd", 0.0)),
+                                 float(res.get("threshold_used", 0.5)),
+                                 res.get("model_used", m))
+                # Friendly summary for non-tech users
+                with cols[idx]:
+                    prob = float(res.get("prob_ckd", 0.0))
+                    thr  = float(res.get("threshold_used", 0.5))
+                    if prob >= thr:
+                        st.markdown("**Result:** This model would flag for CKD follow-up.")
+                    else:
+                        st.markdown("**Result:** This model would not flag for CKD at this time.")
             except requests.HTTPError as e:
                 with cols[idx]:
                     st.error(f"{MODEL_KEYS.get(m,m)} failed")
@@ -358,7 +444,7 @@ with tab_single:
             with ecols[idx]:
                 with st.spinner(f"{MODEL_KEYS.get(m,m)} — SHAP"):
                     try:
-                        er = requests.post(f"{API_URL}/explain", params={"model": m}, json=payload, timeout=45)
+                        er = requests.post(f"{st.session_state['api_url']}/explain", params={"model": m}, json=payload, timeout=60)
                         if er.status_code == 404:
                             st.info("API has no /explain endpoint.")
                             _log(f"Explain skipped ({m}): 404")
@@ -382,6 +468,8 @@ with tab_single:
                                 for row in top[:5]
                             )
                             st.markdown(bullets)
+                            with st.expander("Raw explanation (debug)"):
+                                st.json(exp)
                         else:
                             st.info("No features available.")
                         _log(f"Explain OK ({m}).")
@@ -398,7 +486,7 @@ with tab_single:
 # Batch predictions
 # =========================
 with tab_batch:
-    st.markdown("Upload a CSV, run batch predictions across **all selected models**, and compare metrics.")
+    st.markdown("Upload a CSV, run batch predictions across **all selected models**, and compare.")
     left, right = st.columns([2, 1])
     with left:
         st.caption("Required columns:")
@@ -433,10 +521,10 @@ with tab_batch:
                             rows = df[FEATURE_COLUMNS].to_dict(orient="records")
                             rows = [sanitize_payload(r) for r in rows]
                             r = requests.post(
-                                f"{API_URL}/predict/batch",
+                                f"{st.session_state['api_url']}/predict/batch",
                                 params={"model": m},
                                 json={"rows": rows},
-                                timeout=90
+                                timeout=120
                             )
                             r.raise_for_status()
                             preds = pd.DataFrame(r.json()["predictions"])
@@ -490,7 +578,7 @@ with tab_batch:
 
                         if retrain_after_batch:
                             try:
-                                rr = requests.post(f"{API_URL}/admin/retrain", timeout=10)
+                                rr = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
                                 if rr.status_code in (200, 202):
                                     st.success("Retraining started. Check Health above.")
                                     _log("Retrain triggered after batch.")
@@ -590,7 +678,7 @@ with tab_metrics:
         st.subheader("Service health")
         try:
             first = (selected_models[0] if selected_models else 'rf')
-            h = requests.get(f"{API_URL}/health", params={"model": first}, timeout=10).json()
+            h = requests.get(f"{st.session_state['api_url']}/health", params={"model": first}, timeout=10).json()
             ok = h.get("status") == "ok"
             if ok:
                 st.success(h)
@@ -602,7 +690,7 @@ with tab_metrics:
     with c2:
         st.subheader("Recent inferences")
         try:
-            li = requests.get(f"{API_URL}/metrics/last_inferences?limit=10", timeout=10).json()
+            li = requests.get(f"{st.session_state['api_url']}/metrics/last_inferences?limit=10", timeout=10).json()
             rows = li.get("rows", [])
             if rows:
                 st.dataframe(pd.DataFrame(rows))
@@ -613,10 +701,90 @@ with tab_metrics:
 
     st.subheader("Model status (last retrain)")
     try:
-        rr = requests.get(f"{API_URL}/metrics/retrain_report", timeout=10)
+        rr = requests.get(f"{st.session_state['api_url']}/metrics/retrain_report", timeout=10)
         if rr.status_code == 200:
             st.json(rr.json())
         else:
             st.info("No retrain report found. Click **Rebuild models** at top, then **Reload models**.")
     except Exception as e:
         st.error(f"Report fetch failed: {e}")
+
+# =========================
+# Recommendations (alpha)
+# =========================
+with tab_advice:
+    st.markdown(
+        "AI-assisted recommendations for the **last single prediction**. "
+        "Interprets stage, albuminuria, and flags. No medication dosing. "
+        "_This is not medical advice._"
+    )
+
+    payload = st.session_state.get("last_pred_payload")
+    results = st.session_state.get("last_pred_results", {})
+
+    if not payload or not results:
+        st.info("Run a single prediction first (any model).")
+    else:
+        avail = list(results.keys())
+        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0)
+        chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
+
+        res = results[chosen_key]
+        prob_ckd = float(res.get("prob_ckd", 0.0))
+        stage = int(payload["ckdstage"])
+        alb = int(payload["albuminuriacat"])
+        bp_risk = int(payload["bp_risk"])
+        hyperk = int(payload["hyperkalemiaflag"])
+        anemia = int(payload["anemiaflag"])
+
+        system_prompt = (
+            "You are a multi-agent coordinator for kidney risk recommendations. "
+            "Agents: medical_analyst, diet_specialist, exercise_coach, care_coordinator. "
+            "Use cautious tone. No medication dosing. Always include a 'Not medical advice' disclaimer."
+        )
+
+        user_prompt = f"""
+Prediction summary (model: {MODEL_KEYS.get(chosen_key, chosen_key)}):
+- Prob_CKD: {prob_ckd:.3f}
+- CKD Stage (from GFR): {stage}
+- Albuminuria Category (from ACR): {alb}
+- Flags: BP_Risk={bp_risk}, Hyperkalemia={hyperk}, Anemia={anemia}
+
+Task:
+1) medical_analyst: interpret stage/albuminuria and red flags (e.g., potassium ≥6.0).
+2) diet_specialist: stage- and ACR-aware guidance (protein, sodium, potassium).
+3) exercise_coach: moderate plan; contraindications if anemia/hyperkalemia present.
+4) care_coordinator: suggest lab follow-ups (e.g., repeat ACR), timing, non-directive med chats (ACEi/ARB note).
+
+Constraints:
+- No medication dosing.
+- Include a short, readable 'next steps' list.
+- Add: 'This is not medical advice; consult your clinician.'
+"""
+
+        if st.button("Generate recommendations"):
+            text = call_llm(system_prompt, user_prompt)
+            if text:
+                text_html = nl2br(text)
+                st.markdown(
+                    f"""
+                    <div style="border:1px solid #e6e6e6;border-radius:12px;padding:16px;background:#fafafa">
+                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+                        <div style="font-weight:700">Recommendations — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
+                        <div style="font-size:12px;color:#666">Prob_CKD {prob_ckd:.3f}</div>
+                      </div>
+                      <div style="line-height:1.55">{text_html}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+                st.download_button(
+                    "Download recommendations (.txt)",
+                    data=text.encode("utf-8"),
+                    file_name="ckd_recommendations.txt",
+                    mime="text/plain"
+                )
+                _log("Recommendations generated.")
+            else:
+                st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
+                _log("Recommendations FAILED.")
