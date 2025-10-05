@@ -23,8 +23,8 @@ MODEL_CHOICES = [
     ("Random Forest (rf)", "rf"),
     ("Logistic Regression (logreg)", "logreg"),
 ]
-MODEL_LABELS = {k: v for k, v in MODEL_CHOICES}  # label->key
-MODEL_KEYS = {v: k for k, v in MODEL_CHOICES}    # key->label
+MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}  # label->key
+MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}  # key->label
 
 # Optional LLM config (OpenAI-compatible)
 LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")  # openai | together | openrouter | custom
@@ -63,7 +63,6 @@ def _result_card(label: str, prob_ckd: float, thr: float, model_used: str):
     )
 
 def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
-    """Direct OpenRouter call with required headers."""
     if not LLM_API_KEY:
         st.warning("No LLM API key configured. Add LLM_API_KEY in `.streamlit/secrets.toml`.")
         return None
@@ -85,7 +84,7 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            st.error(f"LLM call failed [{r.status_code}]: {r.text}")
+            st.error("LLM request failed. Check your key/limits.")
             return None
         data = r.json()
         return data.get("choices", [{}])[0].get("message", {}).get("content", None)
@@ -94,21 +93,17 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
         return None
 
 def call_llm(system_prompt: str, user_prompt: str):
-    """OpenRouter by default; fall back to OpenAI SDK style if not using OpenRouter."""
     if LLM_PROVIDER.lower() == "openrouter":
         with st.spinner("Generating cohort insights…"):
             return _call_openrouter_chat(system_prompt, user_prompt)
-
     if not LLM_API_KEY:
         st.warning("No LLM API key configured. Add LLM_API_KEY in `.streamlit/secrets.toml`.")
         return None
-
     try:
         from openai import OpenAI
     except Exception:
         st.error("Package `openai` missing. Install with: `pip install openai`")
         return None
-
     try:
         with st.spinner("Generating cohort insights…"):
             client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
@@ -164,66 +159,85 @@ if "batch_preds" not in st.session_state:
     st.session_state["batch_preds"] = {}        # per-model DataFrame
 if "batch_insights" not in st.session_state:
     st.session_state["batch_insights"] = None
+if "activity_log" not in st.session_state:
+    st.session_state["activity_log"] = []       # simple strings
+
+def _log(msg: str):
+    st.session_state["activity_log"].append(msg)
 
 # =========================
-# Header + Primary Controls (no sidebar)
+# Header + Primary Controls
 # =========================
 st.title("🩺 CKD Predictor")
 st.caption(
-    "Built by a data engineer with 12+ years of ML systems experience — single & batch predictions, model comparison, "
-    "explainability, and LLM-driven cohort insights."
+    "Enterprise-grade demo: single & batch predictions, **multi-model comparison**, SHAP explainability, "
+    "DB-backed metrics, and polished AI cohort insights."
 )
 
-with st.container():
-    colA, colB, colC, colD = st.columns([2.3, 2.3, 1.6, 1.8])
-    with colA:
-        api_url = st.text_input("API URL", API_URL, help="FastAPI base. Example: http://0.0.0.0:8000")
-    with colB:
-        model_labels = [label for label, _ in MODEL_CHOICES]
-        picked_labels = st.multiselect(
-            "Select models to use",
-            model_labels,
-            default=[model_labels[0]],
-            help="Pick one or more models. We'll compare outputs side-by-side."
-        )
-        selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["xgb"]
-    with colC:
-        if st.button("Health"):
-            try:
-                h = requests.get(f"{api_url}/health", params={"model": selected_models[0]}, timeout=10).json()
-                if h.get("status") == "ok":
-                    st.success("OK")
-                else:
-                    st.warning("Check API")
-                st.caption(f"Model: {h.get('model')} • Thr: {h.get('threshold')} • DB log: {h.get('db_logging')}")
-            except Exception as e:
-                st.error("Err")
-                st.caption(str(e))
-    with colD:
-        if st.button("Rebuild models now"):
-            st.caption("Rebuild retrains models on the server using accumulated historical inputs (if DB is configured). "
-                       "After it finishes, click Reload to hot-swap artifacts.")
-            try:
-                r = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
-                st.success("Started") if r.get("status") == "started" else st.info(r)
-            except Exception as e:
-                st.error("Failed to trigger retrain.")
-                st.caption(str(e))
+top_left, top_right = st.columns([3, 2])
+with top_left:
+    model_labels = [label for label, _ in MODEL_CHOICES]
+    picked_labels = st.multiselect(
+        "Select models to use",
+        model_labels,
+        default=[model_labels[0]],
+        help="Pick one or more models. We'll compare outputs side-by-side."
+    )
+    selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["xgb"]
 
-    # row 2 actions
-    colE, colF = st.columns([1.2, 1.2])
-    with colE:
-        if st.button("Reload models"):
+    st.markdown(
+        "<div style='font-size:12px;color:#666;margin-top:-6px'>"
+        "<b>Rebuild models</b> retrains on the server (uses historical inputs if DB logging is enabled). "
+        "<b>Reload models</b> clears the API's in-memory cache to pick up fresh artifacts."
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+    cA, cB, cC = st.columns([1, 1, 1])
+    with cA:
+        if st.button("Health", use_container_width=True):
             try:
-                r = requests.post(f"{api_url}/admin/reload", timeout=20)
-                st.success("Reloaded model cache.")
+                h = requests.get(f"{API_URL}/health", params={"model": selected_models[0]}, timeout=10).json()
+                if h.get("status") == "ok":
+                    st.success("Healthy", icon="✅")
+                    _log(f"Health OK • model={h.get('model')} thr={h.get('threshold')}")
+                else:
+                    st.warning("Check API", icon="⚠️")
+                    _log("Health WARN: API returned non-ok status.")
             except Exception as e:
-                st.error("Reload failed.")
-                st.caption(str(e))
-    with colF:
-        st.info("**What do these buttons do?**  \n"
-                "**Rebuild models now**: kicks off server-side retraining.  \n"
-                "**Reload models**: clears in-memory cache so the API picks up the latest model files.", icon="ℹ️")
+                st.error("API not reachable", icon="🛑")
+                _log(f"Health ERROR: {e}")
+
+    with cB:
+        if st.button("Rebuild models", use_container_width=True):
+            try:
+                r = requests.post(f"{API_URL}/admin/retrain", timeout=10).json()
+                if r.get("status") == "started":
+                    st.success("Retrain started", icon="🛠️")
+                    _log("Retrain triggered (background).")
+                else:
+                    st.info("Retrain request accepted.", icon="ℹ️")
+                    _log(f"Retrain response: {r}")
+            except Exception as e:
+                st.error("Failed to start retrain", icon="🛑")
+                _log(f"Retrain ERROR: {e}")
+
+    with cC:
+        if st.button("Reload models", use_container_width=True):
+            try:
+                _ = requests.post(f"{API_URL}/admin/reload", timeout=20)
+                st.success("Reloaded", icon="🔄")
+                _log("Model cache reloaded.")
+            except Exception as e:
+                st.error("Reload failed", icon="🛑")
+                _log(f"Reload ERROR: {e}")
+
+with top_right:
+    with st.expander("Activity log", expanded=False):
+        if st.session_state["activity_log"]:
+            st.markdown("\n".join(f"- {msg}" for msg in st.session_state["activity_log"]))
+        else:
+            st.caption("No activity yet.")
 
 st.divider()
 
@@ -293,7 +307,7 @@ with tab_single:
         cols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
             try:
-                r = requests.post(f"{api_url}/predict", params={"model": m}, json=payload, timeout=20)
+                r = requests.post(f"{API_URL}/predict", params={"model": m}, json=payload, timeout=20)
                 r.raise_for_status()
                 res = r.json()
                 st.session_state["last_pred_results"][m] = res
@@ -304,19 +318,21 @@ with tab_single:
                 with cols[idx]:
                     st.error(f"{MODEL_KEYS.get(m,m)} failed")
                     st.caption(str(e))
+                _log(f"Single predict ERROR ({m}): {e}")
 
-        # Explainability row (per selected model)
+        # Explainability row (per selected model), compact + robust
         st.markdown("#### Explain prediction (top drivers)")
         ecols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
             if m not in st.session_state["last_pred_results"]:
                 continue
             with ecols[idx]:
-                with st.spinner(f"SHAP: {MODEL_KEYS.get(m,m)}…"):
+                with st.spinner(f"{MODEL_KEYS.get(m,m)} — SHAP"):
                     try:
-                        er = requests.post(f"{api_url}/explain", params={"model": m}, json=payload, timeout=30)
+                        er = requests.post(f"{API_URL}/explain", params={"model": m}, json=payload, timeout=45)
                         if er.status_code == 404:
                             st.info("API has no /explain yet.")
+                            _log(f"Explain skipped ({m}): 404 not found.")
                             continue
                         er.raise_for_status()
                         exp = er.json()
@@ -332,7 +348,6 @@ with tab_single:
                             if "impact" not in df_top.columns and "signed" in df_top.columns:
                                 df_top["impact"] = df_top["signed"].abs()
                             st.bar_chart(df_top.set_index("feature")["impact"])
-                            # compact bullets
                             st.markdown(
                                 "\n".join([
                                     f"- **{row['feature']}** {'↑' if row.get('signed',0)>0 else '↓'} risk (SHAP={row.get('signed',0):+.3f})"
@@ -341,19 +356,21 @@ with tab_single:
                             )
                         else:
                             st.info("No features available.")
+                        _log(f"Explain OK ({m}).")
                     except requests.HTTPError as e:
                         st.error("Explain failed")
                         st.caption(getattr(e, 'response', None) and e.response.text)
+                        _log(f"Explain HTTP ERROR ({m}): {e}")
                     except Exception as e:
                         st.error("Explain error")
                         st.caption(str(e))
+                        _log(f"Explain ERROR ({m}): {e}")
 
 # =========================
 # Batch predictions (Compare)
 # =========================
 with tab_batch:
-    st.markdown("Upload a CSV with the required columns, run batch predictions across **all selected models**, and compare metrics.")
-
+    st.markdown("Upload a CSV, run batch predictions across **all selected models**, and compare metrics.")
     left, right = st.columns([2, 1])
     with left:
         st.caption("Required columns:")
@@ -369,8 +386,11 @@ with tab_batch:
                            file_name="ckd_sample_5rows.csv", mime="text/csv")
 
     file = st.file_uploader("Upload CSV", type=["csv"])
-    retrain_after_batch = st.checkbox("Retrain after batch", value=False,
-                                      help="Optionally kick off server-side retraining after this batch finishes.")
+    retrain_after_batch = st.checkbox(
+        "Retrain after batch",
+        value=False,
+        help="Optionally kick off server-side retraining after this batch finishes."
+    )
 
     if file:
         try:
@@ -388,7 +408,7 @@ with tab_batch:
                         try:
                             rows = df.to_dict(orient="records")
                             r = requests.post(
-                                f"{api_url}/predict/batch",
+                                f"{API_URL}/predict/batch",
                                 params={"model": m},
                                 json={"rows": rows},
                                 timeout=90
@@ -408,12 +428,15 @@ with tab_batch:
                                 "Threshold": f"{thr:.3f}" if thr is not None else "—",
                                 "Rows": len(preds)
                             })
+                            _log(f"Batch OK ({m}) rows={len(preds)}")
                         except requests.HTTPError as e:
                             st.error(f"{MODEL_KEYS.get(m,m)} failed")
                             st.caption(getattr(e, 'response', None) and e.response.text)
+                            _log(f"Batch HTTP ERROR ({m}): {e}")
                         except Exception as e:
                             st.error(f"{MODEL_KEYS.get(m,m)} error")
                             st.caption(str(e))
+                            _log(f"Batch ERROR ({m}): {e}")
 
                     if summary_rows:
                         st.success("Batch complete.")
@@ -443,17 +466,22 @@ with tab_batch:
 
                         if retrain_after_batch:
                             try:
-                                rr = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
-                                st.success("Retraining started. Use Health at top to check when updated.")
+                                rr = requests.post(f"{API_URL}/admin/retrain", timeout=10).json()
+                                if rr.get("status") == "started":
+                                    st.success("Retraining started. Check Health above.")
+                                    _log("Retrain triggered after batch.")
+                                else:
+                                    st.info("Retrain request sent.")
+                                    _log(f"Retrain response after batch: {rr}")
                             except Exception as e:
                                 st.error("Retrain call failed.")
                                 st.caption(str(e))
+                                _log(f"Retrain after batch ERROR: {e}")
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
 
     # --- Cohort insights (AI) — compact card, cached ---
     st.markdown("#### Cohort insights (AI)")
-    # Pick which model’s results feed the insights (default: first available)
     available_models = list(st.session_state.get("batch_preds", {}).keys())
     if not available_models:
         st.info("Run a batch first to enable insights.")
@@ -494,11 +522,14 @@ Task (format output as short sections with bullets):
                 text = call_llm(system_prompt, user_prompt)
                 if text:
                     st.session_state["batch_insights"] = text
+                    _log("Cohort insights generated.")
                 else:
                     st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
+                    _log("Cohort insights FAILED.")
         with c2:
             if st.button("Clear cached summary"):
                 st.session_state["batch_insights"] = None
+                _log("Cohort insights cleared.")
 
         if st.session_state["batch_insights"]:
             st.markdown(
@@ -533,7 +564,8 @@ with tab_metrics:
     with c1:
         st.subheader("Service health")
         try:
-            h = requests.get(f"{api_url}/health", params={"model": (selected_models[0] if selected_models else 'xgb')}, timeout=10).json()
+            first = (selected_models[0] if selected_models else 'xgb')
+            h = requests.get(f"{API_URL}/health", params={"model": first}, timeout=10).json()
             ok = h.get("status") == "ok"
             if ok:
                 st.success(h)
@@ -545,7 +577,7 @@ with tab_metrics:
     with c2:
         st.subheader("Recent inferences")
         try:
-            li = requests.get(f"{api_url}/metrics/last_inferences?limit=10", timeout=10).json()
+            li = requests.get(f"{API_URL}/metrics/last_inferences?limit=10", timeout=10).json()
             rows = li.get("rows", [])
             if rows:
                 st.dataframe(pd.DataFrame(rows))
@@ -556,11 +588,11 @@ with tab_metrics:
 
     st.subheader("Model status (last retrain)")
     try:
-        rr = requests.get(f"{api_url}/metrics/retrain_report", timeout=10)
+        rr = requests.get(f"{API_URL}/metrics/retrain_report", timeout=10)
         if rr.status_code == 200:
             st.json(rr.json())
         else:
-            st.info("No retrain report found. Click **Rebuild models now** above, then **Reload models**.")
+            st.info("No retrain report found. Click **Rebuild models** at top, then **Reload models**.")
     except Exception as e:
         st.error(f"Report fetch failed: {e}")
 
@@ -580,7 +612,6 @@ with tab_advice:
     if not payload or not results:
         st.info("Run a single prediction first (any model).")
     else:
-        # Let user choose which model’s single result to explain in recs
         avail = list(results.keys())
         chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0)
         chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
@@ -634,5 +665,7 @@ Constraints:
                     """,
                     unsafe_allow_html=True
                 )
+                _log("Recommendations generated.")
             else:
                 st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
+                _log("Recommendations FAILED.")
