@@ -4,7 +4,7 @@ import sys
 import json
 import subprocess
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,19 +12,17 @@ from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from joblib import load
-
-# Optional DB logging
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, text  # optional DB logging; safe if DATABASE_URL unset
 
 # -----------------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------------
 
-# If you're still serving the *older* XGBoost model you trained before the
-# unified retrain script, set this True (that model's proba[:,1] was P(non-CKD)).
+# If you're still serving the *older* XGBoost model trained before ml/99_retrain.py,
+# set this to True (that model exposed proba[:,1] as P(non-CKD)).
 # After switching to models produced by ml/99_retrain.py, set this to False
 # (standard proba[:,1] = P(CKD)).
-LEGACY_XGB_FLIPPED = True
+LEGACY_XGB_FLIPPED: bool = True
 
 REGISTRY: Dict[str, Dict[str, object]] = {
     "xgb": {
@@ -44,7 +42,7 @@ REGISTRY: Dict[str, Dict[str, object]] = {
     },
 }
 
-FEATURE_COLS = [
+FEATURE_COLS: List[str] = [
     "age","gender",
     "systolicbp","diastolicbp",
     "serumcreatinine","bunlevels",
@@ -92,24 +90,30 @@ class BatchPredictResponse(BaseModel):
 # App + Model cache
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="CKD Predictor API", version="0.4.0")
+app = FastAPI(title="CKD Predictor API", version="0.5.0")
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
 
-def get_model_and_thr(model_key: str):
+def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
     model_key = model_key.lower()
     if model_key not in REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown model '{model_key}'. Use one of {list(REGISTRY)}")
+    paths = REGISTRY[model_key]
+    if not paths["model"].exists():
+        raise HTTPException(status_code=400, detail=f"Model file missing for '{model_key}'. Train it first.")
+    mdl = load(paths["model"])
+    thr = 0.5
+    if paths["thr"].exists():
+        with open(paths["thr"]) as f:
+            thr = float(json.load(f)["threshold"])
+    flip = bool(paths.get("flip_probas", False))
+    return mdl, thr, flip
+
+def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
     if model_key not in _cache:
-        paths = REGISTRY[model_key]
-        if not paths["model"].exists():
-            raise HTTPException(status_code=400, detail=f"Model file missing for '{model_key}'. Train it first.")
-        mdl = load(paths["model"])
-        thr = 0.5
-        if paths["thr"].exists():
-            with open(paths["thr"]) as f:
-                thr = float(json.load(f)["threshold"])
-        _cache[model_key] = {"model": mdl, "thr": thr, "flip": bool(paths.get("flip_probas", False))}
-    return _cache[model_key]["model"], _cache[model_key]["thr"], _cache[model_key]["flip"]
+        mdl, thr, flip = _load_artifacts(model_key)
+        _cache[model_key] = {"model": mdl, "thr": thr, "flip": flip}
+    d = _cache[model_key]
+    return d["model"], d["thr"], d["flip"]
 
 def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
     # validate columns & order
@@ -287,7 +291,7 @@ def _run_retrain_pipeline():
     next request serves the newly written artifacts.
     """
     try:
-        # Adjust the script path if needed; this should write ./models/* and retrain_report.json
+        # This should write ./models/* and models/retrain_report.json
         subprocess.run([sys.executable, "ml/99_retrain.py"], check=True)
         # After artifacts are updated, clear cache to pick them up
         global _cache
