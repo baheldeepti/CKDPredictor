@@ -1,88 +1,134 @@
-import requests
-import streamlit as st
+import os
+import json
+from pathlib import Path
+from typing import List, Dict
 
-API_URL = st.secrets.get("API_URL", "http://0.0.0.0:8000")  # override via .streamlit/secrets.toml if you want
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel, Field
+from joblib import load
 
-st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="centered")
-st.title("🩺 CKD Predictor (MVP)")
-st.caption("Model-backed API with tuned threshold. Enter metrics, get a risk prediction.")
+# ----------------------------------
+# Model registry (paths per model)
+# ----------------------------------
+REGISTRY: Dict[str, Dict[str, Path]] = {
+    "xgb": {
+        "model": Path("models/xgb_ckd.joblib"),
+        "thr":   Path("models/xgb_ckd_threshold.json"),
+    },
+    "rf": {
+        "model": Path("models/rf_ckd.joblib"),
+        "thr":   Path("models/rf_ckd_threshold.json"),
+    },
+    "logreg": {
+        "model": Path("models/logreg_ckd.joblib"),
+        "thr":   Path("models/logreg_ckd_threshold.json"),
+    },
+}
 
-with st.form("predict_form"):
-    col1, col2 = st.columns(2)
-    with col1:
-        age = st.number_input("Age", min_value=0, max_value=120, value=60)
-        gender = st.selectbox("Gender (0=female,1=male)", options=[0, 1], index=1)
-        systolicbp = st.number_input("Systolic BP (mmHg)", min_value=70, max_value=260, value=140)
-        diastolicbp = st.number_input("Diastolic BP (mmHg)", min_value=40, max_value=160, value=85)
-        serumcreatinine = st.number_input("Serum Creatinine (mg/dL)", min_value=0.2, max_value=15.0, value=2.0, step=0.1)
-        bunlevels = st.number_input("BUN (mg/dL)", min_value=1.0, max_value=200.0, value=28.0, step=0.5)
-        gfr = st.number_input("GFR (mL/min/1.73m²)", min_value=1.0, max_value=200.0, value=55.0, step=0.5)
-        acr = st.number_input("ACR (mg/g)", min_value=0.0, max_value=5000.0, value=120.0, step=1.0)
-    with col2:
-        serumelectrolytessodium = st.number_input("Sodium (mEq/L)", min_value=110.0, max_value=170.0, value=138.0, step=0.5)
-        serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", min_value=2.0, max_value=7.5, value=4.8, step=0.1)
-        hemoglobinlevels = st.number_input("Hemoglobin (g/dL)", min_value=5.0, max_value=20.0, value=12.5, step=0.1)
-        hba1c = st.number_input("HbA1c (%)", min_value=3.5, max_value=15.0, value=6.8, step=0.1)
-        # Derived or categorical
-        bp_risk = 1 if (systolicbp >= 130 or diastolicbp >= 80) else 0
-        hyperkalemiaflag = 1 if serumelectrolytespotassium >= 5.5 else 0
-        anemiaflag = 1 if hemoglobinlevels < 12.0 else 0
+FEATURE_COLS = [
+    "age","gender",
+    "systolicbp","diastolicbp",
+    "serumcreatinine","bunlevels",
+    "gfr","acr",
+    "serumelectrolytessodium","serumelectrolytespotassium",
+    "hemoglobinlevels","hba1c",
+    "pulsepressure","ureacreatinineratio",
+    "ckdstage","albuminuriacat",
+    "bp_risk","hyperkalemiaflag","anemiaflag",
+]
 
-        # CKD staging helpers (simple rules consistent with earlier code)
-        if gfr >= 90: ckdstage = 1
-        elif gfr >= 60: ckdstage = 2
-        elif gfr >= 45: ckdstage = 3
-        elif gfr >= 30: ckdstage = 3
-        elif gfr >= 15: ckdstage = 4
-        else: ckdstage = 5
+class PatientFeatures(BaseModel):
+    age: float; gender: int
+    systolicbp: float; diastolicbp: float
+    serumcreatinine: float; bunlevels: float
+    gfr: float; acr: float
+    serumelectrolytessodium: float; serumelectrolytespotassium: float
+    hemoglobinlevels: float; hba1c: float
+    pulsepressure: float; ureacreatinineratio: float
+    ckdstage: int; albuminuriacat: int
+    bp_risk: int; hyperkalemiaflag: int; anemiaflag: int
 
-        if acr < 30: albuminuriacat = 1
-        elif acr <= 300: albuminuriacat = 2
-        else: albuminuriacat = 3
+class PredictResponse(BaseModel):
+    prediction: int = Field(description="0 = non-CKD, 1 = CKD")
+    prob_ckd: float
+    prob_non_ckd: float
+    threshold_used: float
+    model_used: str
 
-    # Auto-derived features
-    pulsepressure = systolicbp - diastolicbp
-    ureacreatinineratio = float(bunlevels) / (float(serumcreatinine) + 1e-6)
+class BatchPredictRequest(BaseModel):
+    rows: List[PatientFeatures]
 
-    st.write("**Derived fields**")
-    st.write(f"• Pulse Pressure: `{pulsepressure}`  |  • Urea/Creatinine Ratio: `{ureacreatinineratio:.2f}`")
-    st.write(f"• BP Risk: `{bp_risk}`  • Hyperkalemia: `{hyperkalemiaflag}`  • Anemia: `{anemiaflag}`")
-    st.write(f"• CKD Stage (rule-based): `{ckdstage}`  • Albuminuria Cat: `{albuminuriacat}`")
+class BatchPredictResponse(BaseModel):
+    predictions: List[PredictResponse]
 
-    submitted = st.form_submit_button("Predict")
-    if submitted:
-        payload = {
-            "age": age,
-            "gender": gender,
-            "systolicbp": systolicbp,
-            "diastolicbp": diastolicbp,
-            "serumcreatinine": serumcreatinine,
-            "bunlevels": bunlevels,
-            "gfr": gfr,
-            "acr": acr,
-            "serumelectrolytessodium": serumelectrolytessodium,
-            "serumelectrolytespotassium": serumelectrolytespotassium,
-            "hemoglobinlevels": hemoglobinlevels,
-            "hba1c": hba1c,
-            "pulsepressure": pulsepressure,
-            "ureacreatinineratio": ureacreatinineratio,
-            "ckdstage": ckdstage,
-            "albuminuriacat": albuminuriacat,
-            "bp_risk": bp_risk,
-            "hyperkalemiaflag": hyperkalemiaflag,
-            "anemiaflag": anemiaflag
-        }
-        try:
-            r = requests.post(f"{API_URL}/predict", json=payload, timeout=20)
-            r.raise_for_status()
-            res = r.json()
-            label = "CKD" if res["prediction"] == 1 else "Non-CKD"
-            st.success(f"**Prediction:** {label}")
-            st.write(f"**prob_ckd:** {res['prob_ckd']:.3f}  |  **prob_non_ckd:** {res['prob_non_ckd']:.3f}")
-            st.caption(f"Threshold used: {res['threshold_used']:.5f}")
-        except Exception as e:
-            st.error(f"API call failed: {e}")
-            st.code(payload, language="json")
+app = FastAPI(title="CKD Predictor API", version="0.2.0")
 
-st.divider()
-st.caption("Tip: set `API_URL` via `.streamlit/secrets.toml` when deploying.")
+_cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn, "thr": float}}
+
+def get_model_and_thr(model_key: str):
+    model_key = model_key.lower()
+    if model_key not in REGISTRY:
+        raise HTTPException(status_code=400, detail=f"Unknown model '{model_key}'. Use one of {list(REGISTRY)}")
+    if model_key not in _cache:
+        paths = REGISTRY[model_key]
+        if not paths["model"].exists():
+            raise HTTPException(status_code=400, detail=f"Model file missing for '{model_key}'. Train it first.")
+        mdl = load(paths["model"])
+        thr = 0.5
+        if paths["thr"].exists():
+            with open(paths["thr"]) as f:
+                thr = float(json.load(f)["threshold"])
+        _cache[model_key] = {"model": mdl, "thr": thr}
+    return _cache[model_key]["model"], _cache[model_key]["thr"]
+
+def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
+    for c in FEATURE_COLS:
+        if c not in df.columns:
+            raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
+    df = df[FEATURE_COLS].copy()
+    mdl, thr = get_model_and_thr(model_key)
+
+    # Convention:
+    # - XGB was trained with flipped labels => proba[:,1] = P(original class 0)
+    # - RF / LogReg trained normal => proba[:,1] = P(class 1 = CKD)
+    if model_key == "xgb":
+        p_non_ckd = mdl.predict_proba(df)[:, 1]
+        p_ckd = 1.0 - p_non_ckd
+        pred0 = (p_non_ckd >= thr).astype(int)
+        pred_orig = np.where(pred0 == 1, 0, 1)
+    else:
+        p_ckd = mdl.predict_proba(df)[:, 1]
+        p_non_ckd = 1.0 - p_ckd
+        pred_ckd = (p_ckd >= thr).astype(int)
+        pred_orig = pred_ckd
+
+    out = pd.DataFrame({
+        "prediction": pred_orig.astype(int),
+        "prob_ckd": p_ckd.astype(float),
+        "prob_non_ckd": p_non_ckd.astype(float),
+        "threshold_used": thr,
+        "model_used": model_key,
+    })
+    return out
+
+@app.get("/health")
+def health(model: str = Query("xgb", description="xgb | rf | logreg")):
+    try:
+        _, thr = get_model_and_thr(model)
+        return {"status": "ok", "model": model, "threshold": thr}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/predict", response_model=PredictResponse)
+def predict(item: PatientFeatures, model: str = Query("xgb")):
+    df = pd.DataFrame([item.dict()])
+    res = predict_core(df, model).iloc[0].to_dict()
+    return res
+
+@app.post("/predict/batch", response_model=BatchPredictResponse)
+def predict_batch(req: BatchPredictRequest, model: str = Query("xgb")):
+    df = pd.DataFrame([r.dict() for r in req.rows])
+    res = predict_core(df, model).to_dict(orient="records")
+    return {"predictions": res}
