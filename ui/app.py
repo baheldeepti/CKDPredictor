@@ -1,25 +1,69 @@
-import io, requests, streamlit as st
+import io, os, requests, streamlit as st
 import pandas as pd
+from pathlib import Path
 
-API_URL = st.secrets.get("API_URL", "http://0.0.0.0:8000")
+# ---------------------------
+# Config
+# ---------------------------
+API_URL = st.secrets.get("API_URL", "http://0.0.0.0:8000")  # set via .streamlit/secrets.toml
+HERO_PATH = Path("ui/assets/hero.png")  # optional local image
+
+MODEL_OPTIONS = {
+    "XGBoost (recommended)": "xgb",
+    "Random Forest": "rf",
+    "Logistic Regression": "logreg",
+}
+
+FEATURE_COLUMNS = [
+    "age","gender","systolicbp","diastolicbp","serumcreatinine","bunlevels",
+    "gfr","acr","serumelectrolytessodium","serumelectrolytespotassium",
+    "hemoglobinlevels","hba1c","pulsepressure","ureacreatinineratio",
+    "ckdstage","albuminuriacat","bp_risk","hyperkalemiaflag","anemiaflag",
+]
 
 st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
-st.title("🩺 CKD Predictor (MVP)")
-st.caption("Multi-model, threshold-tuned predictions with batch CSV upload.")
 
-# Sidebar: model + API
+# ---------------------------
+# Header / Hero
+# ---------------------------
+left, right = st.columns([2,1])
+with left:
+    st.title("🩺 CKD Predictor")
+    st.subheader("Real-time, explainable risk scoring for chronic kidney disease")
+    st.markdown("""
+    **What you can show stakeholders:**
+    - **Fast, consistent predictions** powered by multiple validated models (XGBoost, Random Forest, Logistic Regression).
+    - **Calibrated thresholds** tuned for the under-represented class (non-CKD), improving recall without wrecking precision.
+    - **Batch mode** for panel screening: upload a CSV and download results for outreach.
+    """)
+with right:
+    if HERO_PATH.exists():
+        st.image(str(HERO_PATH), use_column_width=True, caption="Clinical AI, productized.")
+    else:
+        st.markdown("**Clinical AI, productized.**")
+
+st.divider()
+
+# ---------------------------
+# Sidebar Controls
+# ---------------------------
 with st.sidebar:
-    st.header("Settings")
-    api_url = st.text_input("API URL", API_URL)
-    model = st.selectbox("Model", options=["xgb", "rf", "logreg"], index=0, help="Choose the model backend")
-    if st.button("Check Health"):
+    st.header("Controls")
+    model_label = st.selectbox("Model", list(MODEL_OPTIONS.keys()), index=0)
+    model_key = MODEL_OPTIONS[model_label]
+
+    if st.button("Health Check"):
         try:
-            h = requests.get(f"{api_url}/health", params={"model": model}, timeout=10).json()
+            h = requests.get(f"{API_URL}/health", params={"model": model_key}, timeout=10).json()
             st.success(h)
         except Exception as e:
             st.error(f"Health check failed: {e}")
 
-# ---- Single prediction card ----
+    st.caption("API URL is managed via `.streamlit/secrets.toml`.")
+
+# ---------------------------
+# Single Prediction
+# ---------------------------
 st.subheader("Single Prediction")
 with st.form("predict_form", border=True):
     col1, col2 = st.columns(2)
@@ -56,7 +100,11 @@ with st.form("predict_form", border=True):
     pulsepressure = systolicbp - diastolicbp
     ureacreatinineratio = float(bunlevels) / (float(serumcreatinine) + 1e-6)
 
-    st.caption(f"Derived → PulsePressure={pulsepressure} | Urea/Creatinine={ureacreatinineratio:.2f} | Flags: BP={bp_risk} HK={hyperkalemiaflag} Anemia={anemiaflag} | Stage={ckdstage} Albuminuria={albuminuriacat}")
+    st.caption(
+        f"Derived → PulsePressure={pulsepressure} | Urea/Creatinine={ureacreatinineratio:.2f} "
+        f"| Flags: BP={bp_risk} HK={hyperkalemiaflag} Anemia={anemiaflag} "
+        f"| Stage={ckdstage} Albuminuria={albuminuriacat}"
+    )
     submitted = st.form_submit_button("Predict")
 
     if submitted:
@@ -73,44 +121,58 @@ with st.form("predict_form", border=True):
             "bp_risk": bp_risk, "hyperkalemiaflag": hyperkalemiaflag, "anemiaflag": anemiaflag
         }
         try:
-            r = requests.post(f"{api_url}/predict", params={"model": model}, json=payload, timeout=20)
+            r = requests.post(f"{API_URL}/predict", params={"model": model_key}, json=payload, timeout=20)
             r.raise_for_status()
             res = r.json()
-            label = "CKD" if res["prediction"] == 1 else "Non-CKD"
-            st.success(f"**{label}**  •  prob_ckd={res['prob_ckd']:.3f}  •  prob_non_ckd={res['prob_non_ckd']:.3f}")
-            st.caption(f"Model: {res['model_used']}  •  Threshold: {res['threshold_used']:.5f}")
+            label = "CKD" if res.get("prediction", 1) == 1 else "Non-CKD"
+            st.success(f"**{label}**  •  prob_ckd={res.get('prob_ckd', 0.0):.3f}  •  prob_non_ckd={res.get('prob_non_ckd', 0.0):.3f}")
+            st.caption(f"Model: {res.get('model_used','unknown')}  •  Threshold: {res.get('threshold_used',0.5):.5f}")
         except Exception as e:
             st.error(f"API call failed: {e}")
 
 st.divider()
 
-# ---- Batch CSV upload ----
+# ---------------------------
+# Batch CSV Upload
+# ---------------------------
 st.subheader("Batch Predictions (CSV)")
-st.caption("Upload a CSV with columns matching the API features.")
-sample_cols = ["age","gender","systolicbp","diastolicbp","serumcreatinine","bunlevels","gfr","acr",
-               "serumelectrolytessodium","serumelectrolytespotassium","hemoglobinlevels","hba1c",
-               "pulsepressure","ureacreatinineratio","ckdstage","albuminuriacat","bp_risk","hyperkalemiaflag","anemiaflag"]
-st.code(",".join(sample_cols), language="text")
+st.caption("Upload a CSV matching the required columns. Download a ready-to-fill template below.")
+
+# Template download
+template = pd.DataFrame(columns=FEATURE_COLUMNS)
+csv_bytes = template.to_csv(index=False).encode("utf-8")
+st.download_button("Download Template CSV", data=csv_bytes, file_name="ckd_template.csv", mime="text/csv")
+
+st.code(",".join(FEATURE_COLUMNS), language="text")
 
 file = st.file_uploader("Upload CSV", type=["csv"])
 if file:
     try:
         df = pd.read_csv(file)
-        missing = [c for c in sample_cols if c not in df.columns]
+        missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
         if missing:
             st.error(f"Missing columns: {missing}")
         else:
             st.dataframe(df.head())
             if st.button("Run Batch Predictions"):
                 rows = df.to_dict(orient="records")
-                r = requests.post(f"{api_url}/predict/batch", params={"model": model}, json={"rows": rows}, timeout=60)
+                r = requests.post(f"{API_URL}/predict/batch", params={"model": model_key}, json={"rows": rows}, timeout=60)
                 r.raise_for_status()
                 preds = pd.DataFrame(r.json()["predictions"])
                 st.success("Batch complete.")
                 st.dataframe(preds.head())
-                # Join inputs+outputs for download
+                # Merge inputs + outputs for download
                 merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-                csv = merged.to_csv(index=False).encode("utf-8")
-                st.download_button("Download Results CSV", data=csv, file_name="ckd_batch_predictions.csv", mime="text/csv")
+                out_csv = merged.to_csv(index=False).encode("utf-8")
+                st.download_button("Download Results CSV", data=out_csv, file_name="ckd_batch_predictions.csv", mime="text/csv")
     except Exception as e:
         st.error(f"Failed to read CSV: {e}")
+
+st.divider()
+st.markdown("""
+### How to talk about this app
+- **Outcome-oriented**: turns lab panels into an actionable risk score in under a second.
+- **Model governance**: model and threshold are versioned on disk; swapping models is a dropdown.
+- **Operational fit**: batch upload enables registry scans and outreach.
+- **Extensible**: next sprint adds explainability (SHAP) and AI-generated guidance with citations (RAG).
+""")
