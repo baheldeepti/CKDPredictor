@@ -11,7 +11,7 @@ import pandas as pd
 from joblib import load
 from pydantic import BaseModel, Field
 
-from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Header
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -21,11 +21,11 @@ from sqlalchemy import create_engine, text
 # -----------------------------------------------------------------------------
 # App (instantiate first) + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="0.6.0")
+app = FastAPI(title="CKD Predictor API", version="0.7.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later if needed
+    allow_origins=["*"],  # tighten to your UI origins in prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -35,60 +35,79 @@ app.add_middleware(
 # Configuration
 # -----------------------------------------------------------------------------
 
-# If you're still serving the *older* XGBoost model trained before ml/99_retrain.py,
-# set this to True (that model exposed proba[:,1] as P(non-CKD)).
-# After switching to models produced by ml/99_retrain.py, set this to False
-# (standard proba[:,1] = P(CKD)).
-LEGACY_XGB_FLIPPED: bool = True
+# If your *older* XGBoost model (pre-ml/99_retrain.py) exposed proba[:,1] as P(non-CKD),
+# set this True. If using models from ml/99_retrain.py (standard class1=CKD), keep False.
+LEGACY_XGB_FLIPPED: bool = False
 
 REGISTRY: Dict[str, Dict[str, object]] = {
     "xgb": {
         "model": Path("models/xgb_ckd.joblib"),
-        "thr":   Path("models/xgb_ckd_threshold.json"),
-        "flip_probas": LEGACY_XGB_FLIPPED,  # compatibility switch for legacy XGB
+        "thr": Path("models/xgb_ckd_threshold.json"),
+        "flip_probas": LEGACY_XGB_FLIPPED,
     },
     "rf": {
         "model": Path("models/rf_ckd.joblib"),
-        "thr":   Path("models/rf_ckd_threshold.json"),
+        "thr": Path("models/rf_ckd_threshold.json"),
         "flip_probas": False,
     },
     "logreg": {
         "model": Path("models/logreg_ckd.joblib"),
-        "thr":   Path("models/logreg_ckd_threshold.json"),
+        "thr": Path("models/logreg_ckd_threshold.json"),
         "flip_probas": False,
     },
 }
 
 FEATURE_COLS: List[str] = [
-    "age","gender",
-    "systolicbp","diastolicbp",
-    "serumcreatinine","bunlevels",
-    "gfr","acr",
-    "serumelectrolytessodium","serumelectrolytespotassium",
-    "hemoglobinlevels","hba1c",
-    "pulsepressure","ureacreatinineratio",
-    "ckdstage","albuminuriacat",
-    "bp_risk","hyperkalemiaflag","anemiaflag",
+    "age", "gender",
+    "systolicbp", "diastolicbp",
+    "serumcreatinine", "bunlevels",
+    "gfr", "acr",
+    "serumelectrolytessodium", "serumelectrolytespotassium",
+    "hemoglobinlevels", "hba1c",
+    "pulsepressure", "ureacreatinineratio",
+    "ckdstage", "albuminuriacat",
+    "bp_risk", "hyperkalemiaflag", "anemiaflag",
 ]
 
 # Database (optional; used for logging)
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 
+# Optional lightweight admin protection (set ADMIN_TOKEN env var to enable)
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+
+
+def _check_admin(token: str | None):
+    if not ADMIN_TOKEN:
+        return  # no protection configured
+    if token != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 # -----------------------------------------------------------------------------
 # Schemas
 # -----------------------------------------------------------------------------
 
 class PatientFeatures(BaseModel):
-    age: float; gender: int
-    systolicbp: float; diastolicbp: float
-    serumcreatinine: float; bunlevels: float
-    gfr: float; acr: float
-    serumelectrolytessodium: float; serumelectrolytespotassium: float
-    hemoglobinlevels: float; hba1c: float
-    pulsepressure: float; ureacreatinineratio: float
-    ckdstage: int; albuminuriacat: int
-    bp_risk: int; hyperkalemiaflag: int; anemiaflag: int
+    age: float
+    gender: int
+    systolicbp: float
+    diastolicbp: float
+    serumcreatinine: float
+    bunlevels: float
+    gfr: float
+    acr: float
+    serumelectrolytessodium: float
+    serumelectrolytespotassium: float
+    hemoglobinlevels: float
+    hba1c: float
+    pulsepressure: float
+    ureacreatinineratio: float
+    ckdstage: int
+    albuminuriacat: int
+    bp_risk: int
+    hyperkalemiaflag: int
+    anemiaflag: int
+
 
 class PredictResponse(BaseModel):
     prediction: int = Field(description="0 = Non-CKD, 1 = CKD")
@@ -97,11 +116,14 @@ class PredictResponse(BaseModel):
     threshold_used: float
     model_used: str
 
+
 class BatchPredictRequest(BaseModel):
     rows: List[PatientFeatures]
 
+
 class BatchPredictResponse(BaseModel):
     predictions: List[PredictResponse]
+
 
 class ExplainResponse(BaseModel):
     base_value: float
@@ -112,6 +134,7 @@ class ExplainResponse(BaseModel):
 # Model cache
 # -----------------------------------------------------------------------------
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
+
 
 def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
     mk = model_key.lower()
@@ -127,6 +150,7 @@ def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
             thr = float(json.load(f)["threshold"])
     flip = bool(paths.get("flip_probas", False))
     return mdl, thr, flip
+
 
 def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
     if model_key not in _cache:
@@ -145,6 +169,7 @@ def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
             raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
     return df[FEATURE_COLS].copy()
 
+
 def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
     df = _validate_and_order(df)
     mdl, thr, flip = get_model_and_thr(model_key)
@@ -155,7 +180,7 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
         prob_non_ckd = proba1
         prob_ckd = 1.0 - proba1
         pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 means "Non-CKD"
-        prediction = np.where(pred_class0 == 1, 0, 1)    # 0/1 in original labels
+        prediction = np.where(pred_class0 == 1, 0, 1)    # convert to 0/1 in original labels
     else:
         prob_ckd = proba1
         prob_non_ckd = 1.0 - proba1
@@ -192,6 +217,7 @@ def _save_user_input(conn, row: dict) -> int:
     """)
     return conn.execute(q, row).scalar()
 
+
 def _save_inference(conn, input_id: int, model_used: str, thr: float, pred_row: dict):
     q = text("""
         INSERT INTO inference_log (
@@ -227,6 +253,7 @@ def health(model: str = Query("xgb", description="xgb | rf | logreg")):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+
 @app.post("/predict", response_model=PredictResponse)
 def predict(
     item: PatientFeatures,
@@ -247,6 +274,7 @@ def predict(
 
     return res
 
+
 @app.post("/predict/batch", response_model=BatchPredictResponse)
 def predict_batch(
     req: BatchPredictRequest,
@@ -266,44 +294,6 @@ def predict_batch(
             print(f"[warn] batch logging failed: {e}")
 
     return {"predictions": res_rows}
-
-# === Metrics ================================================================
-
-@app.get("/metrics/retrain_report")
-def retrain_report():
-    """
-    Returns last retraining summary if models/retrain_report.json exists.
-    """
-    path = Path("models/retrain_report.json")
-    if not path.exists():
-        return JSONResponse(
-            status_code=404,
-            content={"detail": "retrain_report.json not found. Run ml/99_retrain.py or wait for CI retrain."},
-        )
-    try:
-        data = json.loads(path.read_text())
-        return data
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"detail": f"failed to read report: {e}"})
-
-@app.get("/metrics/last_inferences")
-def last_inferences(limit: int = Query(10, ge=1, le=100)):
-    """
-    Returns recent inference rows (privacy-preserving), requires DATABASE_URL.
-    """
-    if engine is None:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "DATABASE_URL not configured on server; cannot read inference_log."},
-        )
-    with engine.begin() as c:
-        rows = c.execute(text("""
-            SELECT il.created_at, il.model_used, il.prediction, il.prob_ckd, il.prob_non_ckd, il.threshold_used
-            FROM inference_log il
-            ORDER BY il.created_at DESC
-            LIMIT :limit
-        """), {"limit": limit}).mappings().all()
-    return {"rows": [dict(r) for r in rows]}
 
 # === Explainability ==========================================================
 
@@ -340,7 +330,8 @@ def explain(
                 vals = np.array(sv[1][0])
             else:
                 vals = np.array(sv[0])
-            base = float(explainer.expected_value[1] if isinstance(explainer.expected_value, (list, tuple)) else explainer.expected_value)
+            ev = getattr(explainer, "expected_value", 0.0)
+            base = float(ev[1] if isinstance(ev, (list, tuple)) and len(ev) > 1 else ev)
         except Exception as ee:
             raise HTTPException(status_code=500, detail=f"Failed to compute SHAP values: {e}; fallback error: {ee}")
 
@@ -374,12 +365,18 @@ def _run_retrain_pipeline():
     except subprocess.CalledProcessError as e:
         print(f"[retrain] failed: {e}")
 
+
 @app.post("/admin/retrain")
-def admin_retrain(background: BackgroundTasks, sync: bool = Query(False, description="Run synchronously (blocks request)")):
+def admin_retrain(
+    background: BackgroundTasks,
+    sync: bool = Query(False, description="Run synchronously (blocks request)"),
+    x_admin_token: str | None = Header(None),
+):
     """
     Kicks off retraining. By default runs in the background and returns immediately.
     Use sync=true to block until finished (not recommended for UI).
     """
+    _check_admin(x_admin_token)
     if sync:
         _run_retrain_pipeline()
         return {"status": "done", "mode": "sync"}
@@ -387,12 +384,14 @@ def admin_retrain(background: BackgroundTasks, sync: bool = Query(False, descrip
         background.add_task(_run_retrain_pipeline)
         return {"status": "started", "mode": "async"}
 
+
 @app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
-def admin_reload():
+def admin_reload(x_admin_token: str | None = Header(None)):
     """
     Clears the in-memory model cache so the next call reloads fresh artifacts.
     Use this after CI retraining updates files in ./models.
     """
+    _check_admin(x_admin_token)
     global _cache
     _cache.clear()
-    return
+    return  # 204 No Content
