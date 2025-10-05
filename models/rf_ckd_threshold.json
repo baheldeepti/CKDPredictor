@@ -1,0 +1,8 @@
+{
+  "threshold": 0.24906856629701915,
+  "precision_val_class0": 0.35714285714285715,
+  "recall_val_class0": 0.5,
+  "f1_val_class0": 0.4166666666666667,
+  "ap_val_class0": 0.30594381037928253,
+  "auroc_val_class0": 0.7211790393013101
+}

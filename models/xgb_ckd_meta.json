@@ -1,0 +1,69 @@
+{
+  "features": [
+    "age",
+    "gender",
+    "systolicbp",
+    "diastolicbp",
+    "serumcreatinine",
+    "bunlevels",
+    "gfr",
+    "acr",
+    "serumelectrolytessodium",
+    "serumelectrolytespotassium",
+    "hemoglobinlevels",
+    "hba1c",
+    "pulsepressure",
+    "ureacreatinineratio",
+    "ckdstage",
+    "albuminuriacat",
+    "bp_risk",
+    "hyperkalemiaflag",
+    "anemiaflag"
+  ],
+  "random_state": 42,
+  "scale_pos_weight_flipped": 0.08809746954076851,
+  "metrics": {
+    "train": {
+      "auroc_class0": 0.9559612355181559,
+      "prauc_class0": 0.8030772468882438,
+      "confusion_matrix": [
+        [
+          18,
+          76
+        ],
+        [
+          0,
+          1067
+        ]
+      ]
+    },
+    "val": {
+      "auroc_class0": 0.755240174672489,
+      "prauc_class0": 0.3160566477917071,
+      "confusion_matrix": [
+        [
+          1,
+          19
+        ],
+        [
+          0,
+          229
+        ]
+      ]
+    },
+    "test": {
+      "auroc_class0": 0.8074352548036758,
+      "prauc_class0": 0.32179470244915276,
+      "confusion_matrix": [
+        [
+          1,
+          20
+        ],
+        [
+          2,
+          226
+        ]
+      ]
+    }
+  }
+}
