@@ -78,40 +78,32 @@ FEATURE_COLS: List[str] = [
     "ckdstage", "albuminuriacat",
     "bp_risk", "hyperkalemiaflag", "anemiaflag",
 ]
-
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 # -----------------------------------------------------------------------------
-# Import optional modules (with captured errors for diagnostics)
+# Import optional modules (robust to different entrypoints)
 # -----------------------------------------------------------------------------
 def _import_or_error() -> Dict[str, Any]:
+    from importlib import import_module
     mods: Dict[str, Any] = {"errors": {}}
-    # Agents
-    try:
-        from api.agents import multi_agent_plan  # type: ignore
-        mods["multi_agent_plan"] = multi_agent_plan
-    except Exception as e:
-        mods["multi_agent_plan"] = None
-        mods["errors"]["agents"] = f"{e}\n{traceback.format_exc()}"
-    # Digital Twin
-    try:
-        from api.digital_twin import simulate_whatif  # type: ignore
-        mods["simulate_whatif"] = simulate_whatif
-    except Exception as e:
-        mods["simulate_whatif"] = None
-        mods["errors"]["digital_twin"] = f"{e}\n{traceback.format_exc()}"
-    # Counterfactuals
-    try:
-        from api.counterfactuals import counterfactual  # type: ignore
-        mods["counterfactual"] = counterfactual
-    except Exception as e:
-        mods["counterfactual"] = None
-        mods["errors"]["counterfactuals"] = f"{e}\n{traceback.format_exc()}"
-    # Similarity
-    try:
-        from api.similarity import knn_similar  # type: ignore
-        mods["knn_similar"] = knn_similar
-    except Exception as e:
-        mods["knn_similar"] = None
-        mods["errors"]["similarity"] = f"{e}\n{traceback.format_exc()}"
+
+    # Determine the package prefix safely (works whether run as api.app or as a script)
+    pkg = __package__ or Path(__file__).resolve().parent.name  # usually "api"
+
+    def _try(name: str, attr: str, key: str):
+        try:
+            m = import_module(f"{pkg}.{name}")
+            mods[key] = getattr(m, attr, None)
+        except Exception as e:
+            mods[key] = None
+            mods["errors"][name] = f"{e}\n{traceback.format_exc()}"
+
+    _try("agents", "multi_agent_plan",   "multi_agent_plan")
+    _try("digital_twin", "simulate_whatif", "simulate_whatif")
+    _try("counterfactuals", "counterfactual", "counterfactual")
+    _try("similarity", "knn_similar",     "knn_similar")
     return mods
 
 _opt = _import_or_error()
@@ -555,35 +547,20 @@ def health(model: str = Query("xgb", description="xgb | rf | logreg")):
 
 @app.get("/ready")
 def ready():
-    """
-    Simple readiness/feature probe so the UI can decide which advanced tabs to surface.
-    """
     return {
-        "agents": {"loaded": multi_agent_plan is not None, "error": _import_errors.get("agents")},
-        "whatif": {"loaded": simulate_whatif is not None, "error": _import_errors.get("digital_twin")},
-        "counterfactual": {"loaded": counterfactual is not None, "error": _import_errors.get("counterfactuals")},
-        "similar": {"loaded": knn_similar is not None, "error": _import_errors.get("similarity")},
-        "db": {"connected": bool(_db_ok), "backend": _db_backend()},
+        "ok": True,
+        "agents": bool(multi_agent_plan),
+        "whatif": bool(simulate_whatif),
+        "counterfactual": bool(counterfactual),
+        "similar": bool(knn_similar),
+        "errors": {
+            "agents": _import_errors.get("agents"),
+            "digital_twin": _import_errors.get("digital_twin"),
+            "counterfactuals": _import_errors.get("counterfactuals"),
+            "similarity": _import_errors.get("similarity"),
+        },
     }
 
-@app.post("/predict", response_model=PredictResponse)
-def predict(
-    item: PatientFeatures,
-    model: str = Query("xgb"),
-    save: bool = Query(True, description="Save input+prediction to DB (enabled by default)"),
-):
-    df = pd.DataFrame([item.dict()])
-    res = predict_core(df, model).iloc[0].to_dict()
-
-    if save and (engine is not None):
-        try:
-            with engine.begin() as conn:
-                input_id = _save_user_input(conn, item.dict())
-                _save_inference(conn, input_id, res["model_used"], res["threshold_used"], res)
-        except Exception as e:
-            print(f"[warn] logging failed: {e}")
-
-    return res
 
 @app.post("/predict/batch", response_model=BatchPredictResponse)
 def predict_batch(
