@@ -11,10 +11,10 @@ import numpy as np
 import pandas as pd
 import shap
 from joblib import load
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # Optional DB logging (safe if DATABASE_URL is unset)
@@ -33,9 +33,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Friendly root: redirect "/" -> "/docs"
+@app.get("/", include_in_schema=False)
+def root():
+    return RedirectResponse(url="/docs")
+
 # -----------------------------------------------------------------------------
-# Configuration
+# Configuration (paths & registry)
 # -----------------------------------------------------------------------------
+
+# Base paths
+BASE_DIR = Path(__file__).resolve().parent           # .../api
+MODEL_DIR = Path(os.getenv("MODEL_DIR") or (BASE_DIR.parent / "models"))  # .../<repo_root>/models
+
+# Optional: print where we're loading models from
+print(f"[boot] MODEL_DIR={MODEL_DIR.resolve()} exists={MODEL_DIR.exists()}")
 
 # If your *older* XGBoost model (pre-ml/99_retrain.py) exposed proba[:,1] as P(non-CKD),
 # set this True. If using models from ml/99_retrain.py (standard class1=CKD), keep False.
@@ -43,18 +55,18 @@ LEGACY_XGB_FLIPPED: bool = False
 
 REGISTRY: Dict[str, Dict[str, object]] = {
     "xgb": {
-        "model": Path("models/xgb_ckd.joblib"),
-        "thr": Path("models/xgb_ckd_threshold.json"),
+        "model": MODEL_DIR / "xgb_ckd.joblib",
+        "thr": MODEL_DIR / "xgb_ckd_threshold.json",
         "flip_probas": LEGACY_XGB_FLIPPED,
     },
     "rf": {
-        "model": Path("models/rf_ckd.joblib"),
-        "thr": Path("models/rf_ckd_threshold.json"),
+        "model": MODEL_DIR / "rf_ckd.joblib",
+        "thr": MODEL_DIR / "rf_ckd_threshold.json",
         "flip_probas": False,
     },
     "logreg": {
-        "model": Path("models/logreg_ckd.joblib"),
-        "thr": Path("models/logreg_ckd_threshold.json"),
+        "model": MODEL_DIR / "logreg_ckd.joblib",
+        "thr": MODEL_DIR / "logreg_ckd_threshold.json",
         "flip_probas": False,
     },
 }
@@ -110,6 +122,8 @@ class PatientFeatures(BaseModel):
     anemiaflag: int
 
 class PredictResponse(BaseModel):
+    # Silence: "Field 'model_used' conflicts with protected namespace 'model_'"
+    model_config = ConfigDict(protected_namespaces=())
     prediction: int = Field(description="0 = Non-CKD, 1 = CKD")
     prob_ckd: float
     prob_non_ckd: float
