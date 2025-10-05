@@ -1,5 +1,7 @@
 # ui/app.py
 import os
+import json
+import io
 import requests
 import streamlit as st
 import pandas as pd
@@ -29,7 +31,7 @@ LLM_API_KEY  = st.secrets.get("LLM_API_KEY", "")
 LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
 LLM_MODEL    = st.secrets.get("LLM_MODEL", "openrouter/auto")
 
-# Optional branding for OpenRouter headers (recommended)
+# Optional branding for OpenRouter headers
 APP_URL   = st.secrets.get("APP_URL", "https://github.com/baheldeepti/CKDPredictor")
 APP_TITLE = st.secrets.get("APP_TITLE", "CKD Predictor")
 
@@ -62,11 +64,9 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
     if not LLM_API_KEY:
         st.warning("No LLM API key configured. Add LLM_API_KEY in `.streamlit/secrets.toml`.")
         return None
-
     url = (LLM_BASE_URL.rstrip("/") + "/chat/completions") if LLM_BASE_URL else "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
-        # OpenRouter recommends these for routing/limits transparency
         "HTTP-Referer": APP_URL,
         "X-Title": APP_TITLE,
         "Content-Type": "application/json",
@@ -91,10 +91,7 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
         return None
 
 def call_llm(system_prompt: str, user_prompt: str):
-    """
-    OpenRouter: use requests with required headers.
-    Other providers: use OpenAI SDK with base_url (OpenAI-compatible gateways).
-    """
+    """OpenRouter by default; fall back to OpenAI SDK style if not using OpenRouter."""
     if LLM_PROVIDER.lower() == "openrouter":
         with st.spinner("Generating with OpenRouter…"):
             return _call_openrouter_chat(system_prompt, user_prompt)
@@ -144,7 +141,6 @@ def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
     return bp_risk, hyperk, anemia, stage, alb
 
 def sample_records_df():
-    # 5 realistic synthetic rows matching the schema
     rows = [
         [65, 1, 148, 86, 2.1, 32, 52, 120, 139, 4.8, 12.2, 6.5, 62, 15.2, 2, 2, 1, 0, 0],
         [54, 0, 132, 82, 1.6, 28, 65, 35, 141, 4.3, 13.5, 6.1, 50, 17.5, 2, 2, 1, 0, 0],
@@ -154,20 +150,21 @@ def sample_records_df():
     ]
     return pd.DataFrame(rows, columns=FEATURE_COLUMNS)
 
-# Keep last single-case prediction for the Recommendations tab
+# ===== Session state =========================================================
 if "last_pred_payload" not in st.session_state:
     st.session_state["last_pred_payload"] = None
 if "last_pred_result" not in st.session_state:
     st.session_state["last_pred_result"] = None
-# Keep batch preds across reruns for insights
 if "batch_preds" not in st.session_state:
     st.session_state["batch_preds"] = None
+if "batch_insights" not in st.session_state:
+    st.session_state["batch_insights"] = None
 
-# ===== Header =================================================================
+# ===== Header ================================================================
 st.title("🩺 CKD Predictor")
-st.caption("Single & batch predictions with thresholding, metrics, retraining, and AI recommendations.")
+st.caption("Single & batch predictions with explainability, metrics, retraining, and AI recommendations.")
 
-# ===== Sidebar Controls ========================================================
+# ===== Sidebar Controls ======================================================
 with st.sidebar:
     st.header("Settings")
     api_url = st.text_input("API URL", API_URL)
@@ -201,12 +198,12 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Retrain call failed: {e}")
 
-# ===== Tabs ===================================================================
+# ===== Tabs ==================================================================
 tab_single, tab_batch, tab_metrics, tab_advice = st.tabs(
     ["Single prediction", "Batch predictions", "Metrics", "Recommendations (alpha)"]
 )
 
-# ---- Single prediction --------------------------------------------------------
+# ---- Single prediction -------------------------------------------------------
 with tab_single:
     st.markdown("**Use this tab to score a single case.** Fill the form and click **Predict**. "
                 "Optionally tick **Retrain after submit** to kick off server-side retraining.")
@@ -267,6 +264,7 @@ with tab_single:
             st.session_state["last_pred_payload"] = payload
             st.session_state["last_pred_result"] = res
 
+            # Optional retrain (respects checkbox)
             if retrain_after:
                 try:
                     rr = requests.post(f"{api_url}/admin/retrain", timeout=10).json()
@@ -277,6 +275,61 @@ with tab_single:
         except Exception as e:
             st.error(f"API call failed: {e}")
 
+        # ---- Explainability (Priority 1) ----
+        st.subheader("Explain prediction (top drivers)")
+        with st.spinner("Fetching SHAP explanation…"):
+            try:
+                # Expecting your API to support: POST /explain with same payload
+                er = requests.post(f"{api_url}/explain", params={"model": model_key}, json=payload, timeout=30)
+                if er.status_code == 404:
+                    st.info("The API has no /explain endpoint yet. Add it on the server to enable SHAP explanations.")
+                else:
+                    er.raise_for_status()
+                    exp = er.json()  # { "shap_values": {...feature: value...}, "base_value": float, "top": [{"feature":..., "value":..., "impact":...}], ...}
+                    # Show top contributions
+                    top = exp.get("top", [])
+                    if not top:
+                        # Fallback: build from shap_values dict if provided
+                        shap_map = exp.get("shap_values", {})
+                        top = sorted(
+                            [{"feature": k, "impact": abs(v), "signed": v} for k, v in shap_map.items()],
+                            key=lambda x: x["impact"],
+                            reverse=True
+                        )[:8]
+
+                    if top:
+                        df_top = pd.DataFrame(top)
+                        # prefer 'impact' if present, else |signed|
+                        if "impact" not in df_top.columns and "signed" in df_top.columns:
+                            df_top["impact"] = df_top["signed"].abs()
+
+                        st.bar_chart(df_top.set_index("feature")["impact"])
+                        # bullets with sign if available
+                        bullets = []
+                        for row in (top[:8]):
+                            f = row.get("feature")
+                            s = row.get("signed", None)
+                            if s is None:
+                                bullets.append(f"- **{f}** contributed the most to the score.")
+                            else:
+                                arrow = "↑" if s > 0 else "↓"
+                                bullets.append(f"- **{f}** {arrow} risk (SHAP={s:+.3f})")
+                        st.markdown("\n".join(bullets))
+
+                        # Download JSON
+                        st.download_button(
+                            "Download explanation (JSON)",
+                            data=json.dumps(exp, indent=2).encode("utf-8"),
+                            file_name="ckd_explanation.json",
+                            mime="application/json",
+                        )
+                    else:
+                        st.info("No top features available in explanation payload.")
+            except requests.HTTPError as e:
+                st.error(f"Explain API failed: {e}  •  Response: {getattr(e, 'response', None) and e.response.text}")
+            except Exception as e:
+                st.error(f"Explain call error: {e}")
+
 # ---- Batch predictions -------------------------------------------------------
 with tab_batch:
     st.markdown("**Use this tab to score a file of cases.** Download a blank template or a 5-row sample, upload, then click **Run Batch Predictions**.")
@@ -284,17 +337,17 @@ with tab_batch:
     template_blank = pd.DataFrame(columns=FEATURE_COLUMNS)
     sample5 = sample_records_df()
 
-    cta = st.columns(2)
+    cta = st.columns(3)
     with cta[0]:
-        st.download_button("Download Blank Template CSV",
+        st.download_button("Blank Template CSV",
             data=template_blank.to_csv(index=False).encode("utf-8"),
             file_name="ckd_template_blank.csv", mime="text/csv")
     with cta[1]:
-        st.download_button("Download Sample CSV (5 rows)",
+        st.download_button("Sample CSV (5 rows)",
             data=sample5.to_csv(index=False).encode("utf-8"),
             file_name="ckd_sample_5rows.csv", mime="text/csv")
-
-    st.code(",".join(FEATURE_COLUMNS), language="text")
+    with cta[2]:
+        st.code(",".join(FEATURE_COLUMNS), language="text")
 
     file = st.file_uploader("Upload CSV", type=["csv"])
     retrain_after_batch = st.checkbox("Retrain after batch", value=False)
@@ -319,7 +372,7 @@ with tab_batch:
                         )
                         r.raise_for_status()
                         preds = pd.DataFrame(r.json()["predictions"])
-                        st.session_state["batch_preds"] = preds   # persist across reruns
+                        st.session_state["batch_preds"] = preds   # persist
 
                         st.success("Batch complete.")
                         ckd_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
@@ -347,23 +400,25 @@ with tab_batch:
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
 
-    # --- Cohort insights (AI) ---
-    with st.expander("Generate cohort insights (AI)"):
-        st.caption("Summarize the most recent batch results using your LLM key (OpenRouter/OpenAI/etc.).")
-        preds = st.session_state.get("batch_preds")
-        if preds is None or preds.empty:
-            st.info("Run a batch first to enable insights.")
-        else:
+    # --- Cohort insights (AI) — cached + copy/download ---
+    st.subheader("Cohort insights (AI)")
+    preds = st.session_state.get("batch_preds")
+    if preds is None or (isinstance(preds, pd.DataFrame) and preds.empty):
+        st.info("Run a batch first to enable insights.")
+    else:
+        pos_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
+        avg_prob = preds["prob_ckd"].mean() if "prob_ckd" in preds else 0.0
+
+        c1, c2 = st.columns(2)
+        with c1:
             if st.button("Summarize cohort"):
-                pos_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
-                avg_prob = preds["prob_ckd"].mean() if "prob_ckd" in preds else 0.0
                 system_prompt = (
                     "You are a cautious, clinical assistant creating cohort insights for CKD screening.\n"
                     "Do not give medication dosing. Provide red flags, diet/exercise high-level guidance,\n"
                     "and a follow-up checklist. Add 'Not medical advice.'"
                 )
                 user_prompt = f"""
-We screened a batch of cases for CKD. Summarize insights for stakeholders.
+We screened a batch of cases for CKD.
 
 Metrics:
 - Positive rate: {pos_rate:.3f}
@@ -378,9 +433,21 @@ Task:
 """
                 text = call_llm(system_prompt, user_prompt)
                 if text:
-                    st.markdown(text)
+                    st.session_state["batch_insights"] = text
                 else:
                     st.error("LLM did not return text. Check API key/credits, headers, and model name in `.streamlit/secrets.toml`.")
+        with c2:
+            if st.button("Clear cached summary"):
+                st.session_state["batch_insights"] = None
+
+        if st.session_state["batch_insights"]:
+            st.text_area("Cached summary (copy from here):", st.session_state["batch_insights"], height=240)
+            st.download_button(
+                "Download summary (.txt)",
+                data=st.session_state["batch_insights"].encode("utf-8"),
+                file_name="ckd_batch_insights.txt",
+                mime="text/plain"
+            )
 
 # ---- Metrics ----------------------------------------------------------------
 with tab_metrics:
@@ -407,11 +474,13 @@ with tab_metrics:
         except Exception as e:
             st.error(f"Fetch failed: {e}")
 
-    st.write("**Last Retrain Report**")
+    st.write("**Model status (last retrain)**")
     try:
         rr = requests.get(f"{api_url}/metrics/retrain_report", timeout=10)
         if rr.status_code == 200:
-            st.json(rr.json())
+            data = rr.json()
+            # Expecting: {"at":"ISO time","by":"ci","models":{"xgb":{...},"rf":{...},...}}
+            st.json(data)
         else:
             st.info("No retrain report found.")
     except Exception as e:
