@@ -1,12 +1,15 @@
 # api/app.py
 import os
+import sys
 import json
+import subprocess
 from pathlib import Path
 from typing import List, Dict
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query, status
+from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from joblib import load
 
@@ -17,17 +20,17 @@ from sqlalchemy import create_engine, text
 # Configuration
 # -----------------------------------------------------------------------------
 
-# IMPORTANT:
-# If you're still serving the *older* XGBoost model you trained before the unified retrain script,
-# set this True (because that model's proba[:,1] was P(non-CKD)).
-# After switching to models produced by ml/99_retrain.py, set this to False (standard proba[:,1] = P(CKD)).
+# If you're still serving the *older* XGBoost model you trained before the
+# unified retrain script, set this True (that model's proba[:,1] was P(non-CKD)).
+# After switching to models produced by ml/99_retrain.py, set this to False
+# (standard proba[:,1] = P(CKD)).
 LEGACY_XGB_FLIPPED = True
 
 REGISTRY: Dict[str, Dict[str, object]] = {
     "xgb": {
         "model": Path("models/xgb_ckd.joblib"),
         "thr":   Path("models/xgb_ckd_threshold.json"),
-        "flip_probas": LEGACY_XGB_FLIPPED,  # compatibility switch for XGB only
+        "flip_probas": LEGACY_XGB_FLIPPED,  # compatibility switch for legacy XGB
     },
     "rf": {
         "model": Path("models/rf_ckd.joblib"),
@@ -89,7 +92,7 @@ class BatchPredictResponse(BaseModel):
 # App + Model cache
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="CKD Predictor API", version="0.3.1")
+app = FastAPI(title="CKD Predictor API", version="0.4.0")
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
 
 def get_model_and_thr(model_key: str):
@@ -238,21 +241,12 @@ def predict_batch(
 
     return {"predictions": res_rows}
 
-@app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
-def admin_reload():
-    """
-    Clears the in-memory model cache so the next call reloads fresh artifacts.
-    Use this after CI retraining updates files in ./models.
-    """
-    global _cache
-    _cache.clear()
-    return
-from fastapi.responses import JSONResponse
+# === Metrics ================================================================
 
 @app.get("/metrics/retrain_report")
 def retrain_report():
     """
-    Returns the last retraining summary if models/retrain_report.json exists.
+    Returns last retraining summary if models/retrain_report.json exists.
     """
     path = Path("models/retrain_report.json")
     if not path.exists():
@@ -266,12 +260,10 @@ def retrain_report():
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"failed to read report: {e}"})
 
-
 @app.get("/metrics/last_inferences")
 def last_inferences(limit: int = Query(10, ge=1, le=100)):
     """
-    Returns the most recent inference rows (joined with nothing else for privacy),
-    requires DATABASE_URL to be set.
+    Returns recent inference rows (privacy-preserving), requires DATABASE_URL.
     """
     if engine is None:
         return JSONResponse(
@@ -286,3 +278,43 @@ def last_inferences(limit: int = Query(10, ge=1, le=100)):
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
     return {"rows": [dict(r) for r in rows]}
+
+# === Retrain / Reload =======================================================
+
+def _run_retrain_pipeline():
+    """
+    Runs the unified retraining script, then clears in-memory cache so the
+    next request serves the newly written artifacts.
+    """
+    try:
+        # Adjust the script path if needed; this should write ./models/* and retrain_report.json
+        subprocess.run([sys.executable, "ml/99_retrain.py"], check=True)
+        # After artifacts are updated, clear cache to pick them up
+        global _cache
+        _cache.clear()
+        print("[retrain] completed; cache cleared.")
+    except subprocess.CalledProcessError as e:
+        print(f"[retrain] failed: {e}")
+
+@app.post("/admin/retrain")
+def admin_retrain(background: BackgroundTasks, sync: bool = Query(False, description="Run synchronously (blocks request)")):
+    """
+    Kicks off retraining. By default runs in the background and returns immediately.
+    Use sync=true to block until finished (not recommended for UI).
+    """
+    if sync:
+        _run_retrain_pipeline()
+        return {"status": "done", "mode": "sync"}
+    else:
+        background.add_task(_run_retrain_pipeline)
+        return {"status": "started", "mode": "async"}
+
+@app.post("/admin/reload", status_code=status.HTTP_204_NO_CONTENT)
+def admin_reload():
+    """
+    Clears the in-memory model cache so the next call reloads fresh artifacts.
+    Use this after CI retraining updates files in ./models.
+    """
+    global _cache
+    _cache.clear()
+    return
