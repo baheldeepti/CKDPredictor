@@ -97,6 +97,15 @@ def sanitize_payload(d: dict) -> dict:
         out[k] = float(v)
     return out
 
+def safe_json_loads(txt: str, fallback: dict = None) -> dict:
+    """Parse JSON safely; return fallback (or {}) on error."""
+    try:
+        if not txt or not txt.strip():
+            return fallback if fallback is not None else {}
+        return json.loads(txt)
+    except Exception:
+        return fallback if fallback is not None else {}
+
 def _risk_badge(prob_ckd: float, thr: float) -> tuple[str, str, str]:
     if prob_ckd >= thr:
         return "Above threshold", "#fee2e2", "#991b1b"
@@ -124,6 +133,16 @@ def _result_card(prob_ckd: float, thr: float, model_used: str):
         """,
         unsafe_allow_html=True,
     )
+
+def _api_get(url: str, params: dict | None = None, timeout: int = 30):
+    r = requests.get(url, params=params, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+def _api_post(url: str, json_body: dict | None = None, params: dict | None = None, timeout: int = 60):
+    r = requests.post(url, params=params, json=json_body, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
     if not LLM_API_KEY:
@@ -236,11 +255,11 @@ def _log(msg: str):
 # =========================
 with st.sidebar:
     st.markdown("### 🔌 Connection")
-    api_input = st.text_input("Backend API URL", value=st.session_state["api_url"], help="Override if running locally.")
+    api_input = st.text_input("Backend API URL", value=st.session_state["api_url"], help="Override if running locally.", key="sb_api_url")  # KEY
     api_input = _normalize_api(api_input)
-    if st.button("Check API"):
+    if st.button("Check API", key="btn_check_api"):  # KEY
         try:
-            h = requests.get(f"{api_input}/health", params={"model":"rf"}, timeout=10).json()
+            h = _api_get(f"{api_input}/health", params={"model":"rf"}, timeout=10)
             ok = h.get("status") == "ok"
             db = "connected" if h.get("db_connected") else "not connected"
             if ok:
@@ -272,7 +291,8 @@ with top_left:
         "Models to compare",
         model_labels,
         default=[model_labels[1]],  # default RF
-        help="Pick one or more models. We’ll compare outputs side-by-side."
+        help="Pick one or more models. We’ll compare outputs side-by-side.",
+        key="global_models_pick"  # KEY
     )
     selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["rf"]
 
@@ -286,9 +306,9 @@ with top_left:
 
     cA, cB, cC = st.columns([1, 1, 1])
     with cA:
-        if st.button("API health", use_container_width=True):
+        if st.button("API health", use_container_width=True, key="btn_health"):  # KEY
             try:
-                h = requests.get(f"{st.session_state['api_url']}/health", params={"model": selected_models[0]}, timeout=10).json()
+                h = _api_get(f"{st.session_state['api_url']}/health", params={"model": selected_models[0]}, timeout=10)
                 if h.get("status") == "ok":
                     st.success("Healthy", icon="✅")
                     _log(f"Health OK • model={h.get('model')} thr={h.get('threshold')} db={h.get('db_backend')}")
@@ -300,7 +320,7 @@ with top_left:
                 _log(f"Health ERROR: {e}")
 
     with cB:
-        if st.button("Train models", use_container_width=True):
+        if st.button("Train models", use_container_width=True, key="btn_train"):  # KEY
             try:
                 r = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
                 if r.status_code in (200, 202):
@@ -313,7 +333,7 @@ with top_left:
                 _log(f"Retrain ERROR: {e}")
 
     with cC:
-        if st.button("Reload models", use_container_width=True):
+        if st.button("Reload models", use_container_width=True, key="btn_reload"):  # KEY
             try:
                 _ = requests.post(f"{st.session_state['api_url']}/admin/reload", timeout=20)
                 st.success("Reloaded", icon="🔄")
@@ -365,11 +385,11 @@ with tab_single:
     # Prefill / Reset controls
     c1, c2, c3 = st.columns([1,1,2])
     with c1:
-        sample_idx = st.selectbox("Prefill sample", [1,2,3,4,5], index=1)
+        sample_idx = st.selectbox("Prefill sample", [1,2,3,4,5], index=1, key="sp_sample_idx")  # KEY
     with c2:
-        do_prefill = st.button("Use sample")
+        do_prefill = st.button("Use sample", key="sp_use_sample")  # KEY
     with c3:
-        do_reset = st.button("Reset form")
+        do_reset = st.button("Reset form", key="sp_reset")  # KEY
 
     def _defaults(si=None):
         df = sample_records_df()
@@ -396,19 +416,19 @@ with tab_single:
             (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults()
 
         with col1:
-            age = st.number_input("Age (years)", 0, 120, age_d)
-            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_d)
-            systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d)
-            diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, dbp_d)
-            serumcreatinine = st.number_input("Serum creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1)
-            bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, bun_d, step=0.5)
-            gfr = st.number_input("GFR (mL/min/1.73m²)", 1.0, 200.0, gfr_d, step=0.5)
-            acr = st.number_input("Albumin/creatinine ratio, ACR (mg/g)", 0.0, 5000.0, acr_d, step=1.0)
+            age = st.number_input("Age (years)", 0, 120, age_d, key="sp_age")  # KEY
+            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_d, key="sp_gender")  # KEY
+            systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d, key="sp_sbp")  # KEY
+            diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, dbp_d, key="sp_dbp")  # KEY
+            serumcreatinine = st.number_input("Serum creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1, key="sp_sc")  # KEY
+            bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, bun_d, step=0.5, key="sp_bun")  # KEY
+            gfr = st.number_input("GFR (mL/min/1.73m²)", 1.0, 200.0, gfr_d, step=0.5, key="sp_gfr")  # KEY
+            acr = st.number_input("Albumin/creatinine ratio, ACR (mg/g)", 0.0, 5000.0, acr_d, step=1.0, key="sp_acr")  # KEY
         with col2:
-            serumelectrolytessodium = st.number_input("Sodium (mEq/L)", 110.0, 170.0, na_d, step=0.5)
-            serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, k_d, step=0.1)
-            hemoglobinlevels = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, hb_d, step=0.1)
-            hba1c = st.number_input("HbA1c (%)", 3.5, 15.0, a1c_d, step=0.1)
+            serumelectrolytessodium = st.number_input("Sodium (mEq/L)", 110.0, 170.0, na_d, step=0.5, key="sp_na")  # KEY
+            serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, k_d, step=0.1, key="sp_k")  # KEY
+            hemoglobinlevels = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, hb_d, step=0.1, key="sp_hb")  # KEY
+            hba1c = st.number_input("HbA1c (%)", 3.5, 15.0, a1c_d, step=0.1, key="sp_a1c")  # KEY
 
             bp_risk, hyperkalemiaflag, anemiaflag, ckdstage, albuminuriacat = derive_flags_and_bins(
                 systolicbp, diastolicbp, serumelectrolytespotassium, hemoglobinlevels, gfr, acr
@@ -423,7 +443,7 @@ with tab_single:
             f"CKD stage={ckdstage}, Albuminuria category={albuminuriacat}"
         )
 
-        do_predict = st.form_submit_button("Predict with selected models")
+        do_predict = st.form_submit_button("Predict with selected models", key="sp_predict")  # KEY
 
     if do_predict:
         payload = {
@@ -445,9 +465,7 @@ with tab_single:
         cols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
             try:
-                r = requests.post(f"{st.session_state['api_url']}/predict", params={"model": m}, json=payload, timeout=20)
-                r.raise_for_status()
-                res = r.json()
+                res = _api_post(f"{st.session_state['api_url']}/predict", json_body=payload, params={"model": m}, timeout=20)
                 st.session_state["last_pred_results"][m] = res
                 with cols[idx]:
                     _result_card(float(res.get("prob_ckd", 0.0)),
@@ -457,10 +475,7 @@ with tab_single:
                     prob = float(res.get("prob_ckd", 0.0))
                     thr  = float(res.get("threshold_used", 0.5))
                     st.markdown("**Plain-English result**")
-                    if prob >= thr:
-                        st.markdown("This model would **flag** for CKD **follow-up**.")
-                    else:
-                        st.markdown("This model would **not** flag for CKD at this time.")
+                    st.markdown("This model would **flag** for CKD **follow-up**." if prob >= thr else "This model would **not** flag for CKD at this time.")
             except requests.HTTPError as e:
                 with cols[idx]:
                     st.error(f"{MODEL_KEYS.get(m,m)} failed")
@@ -482,13 +497,12 @@ with tab_single:
             with ecols[idx]:
                 with st.spinner(f"{MODEL_KEYS.get(m,m)} — computing SHAP"):
                     try:
-                        er = requests.post(f"{st.session_state['api_url']}/explain", params={"model": m}, json=st.session_state["last_pred_payload"], timeout=60)
-                        if er.status_code == 404:
-                            st.info("API has no /explain endpoint.")
-                            _log(f"Explain skipped ({m}): 404")
-                            continue
-                        er.raise_for_status()
-                        exp = er.json()
+                        exp = _api_post(
+                            f"{st.session_state['api_url']}/explain",
+                            json_body=st.session_state["last_pred_payload"],
+                            params={"model": m},
+                            timeout=60
+                        )
                         top = exp.get("top") or []
                         if not top:
                             shap_map = exp.get("shap_values", {}) or {}
@@ -506,7 +520,7 @@ with tab_single:
                                 for row in top[:5]
                             )
                             st.markdown(bullets)
-                            with st.expander("Raw explanation (debug)"):
+                            with st.expander("Raw explanation (debug)", expanded=False):
                                 st.json(exp)
                         else:
                             st.info("No features available.")
@@ -534,13 +548,13 @@ with tab_batch:
         sample5 = sample_records_df()
         st.download_button("Blank template CSV",
                            data=template_blank.to_csv(index=False).encode("utf-8"),
-                           file_name="ckd_template_blank.csv", mime="text/csv")
+                           file_name="ckd_template_blank.csv", mime="text/csv", key="dl_blank_template")  # KEY
         st.download_button("Sample CSV (5 rows)",
                            data=sample5.to_csv(index=False).encode("utf-8"),
-                           file_name="ckd_sample_5rows.csv", mime="text/csv")
+                           file_name="ckd_sample_5rows.csv", mime="text/csv", key="dl_sample5")  # KEY
 
-    file = st.file_uploader("Upload CSV", type=["csv"])
-    retrain_after_batch = st.checkbox("Start training after batch (optional)", value=False)
+    file = st.file_uploader("Upload CSV", type=["csv"], key="batch_file")  # KEY
+    retrain_after_batch = st.checkbox("Start training after batch (optional)", value=False, key="batch_retrain")  # KEY
 
     if file:
         try:
@@ -551,21 +565,20 @@ with tab_batch:
             else:
                 st.dataframe(df.head())
 
-                if st.button("Run batch with selected models"):
+                if st.button("Run batch with selected models", key="btn_run_batch"):  # KEY
                     st.session_state["batch_preds"] = {}
                     summary_rows = []
                     for m in selected_models:
                         try:
                             rows = df[FEATURE_COLUMNS].to_dict(orient="records")
                             rows = [sanitize_payload(r) for r in rows]
-                            r = requests.post(
+                            r = _api_post(
                                 f"{st.session_state['api_url']}/predict/batch",
                                 params={"model": m},
-                                json={"rows": rows},
+                                json_body={"rows": rows},
                                 timeout=120
                             )
-                            r.raise_for_status()
-                            preds = pd.DataFrame(r.json()["predictions"])
+                            preds = pd.DataFrame(r["predictions"])
                             preds["model_used"] = m
                             st.session_state["batch_preds"][m] = preds
 
@@ -603,7 +616,7 @@ with tab_batch:
                                 data=merged.to_csv(index=False).encode("utf-8"),
                                 file_name=f"ckd_batch_predictions_{m}.csv",
                                 mime="text/csv",
-                                key=f"dl_{m}"
+                                key=f"dl_model_{m}"  # KEY
                             )
                         if merged_list:
                             all_merged = pd.concat(merged_list, axis=0, ignore_index=True)
@@ -612,6 +625,7 @@ with tab_batch:
                                 data=all_merged.to_csv(index=False).encode("utf-8"),
                                 file_name="ckd_batch_predictions_all_models.csv",
                                 mime="text/csv",
+                                key="dl_all_models"  # KEY
                             )
 
                         if retrain_after_batch:
@@ -640,7 +654,8 @@ with tab_batch:
         insights_model = st.selectbox(
             "Summarize which model’s output?",
             [MODEL_KEYS.get(m, m) for m in available_models],
-            index=0
+            index=0,
+            key="batch_insights_model"  # KEY
         )
         chosen_m = next((k for k in available_models if MODEL_KEYS.get(k, k) == insights_model), available_models[0])
 
@@ -650,7 +665,7 @@ with tab_batch:
 
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Summarize cohort"):
+            if st.button("Summarize cohort", key="btn_summarize_cohort"):  # KEY
                 system_prompt = (
                     "You are a cautious, clinical assistant creating cohort insights for CKD screening.\n"
                     "Keep it concise and structured. Avoid medication dosing. Provide red flags, high-level diet/exercise guidance,\n"
@@ -678,7 +693,7 @@ Task (format output as short sections with bullets):
                     st.error("LLM did not return text. Check the key/credits.")
                     _log("Cohort insights FAILED.")
         with c2:
-            if st.button("Clear cached summary"):
+            if st.button("Clear cached summary", key="btn_clear_insights"):  # KEY
                 st.session_state["batch_insights"] = None
                 _log("Cohort insights cleared.")
 
@@ -700,7 +715,8 @@ Task (format output as short sections with bullets):
                 "Download insights (.txt)",
                 data=st.session_state["batch_insights"].encode("utf-8"),
                 file_name="ckd_batch_insights.txt",
-                mime="text/plain"
+                mime="text/plain",
+                key="dl_insights_txt"  # KEY
             )
 
 # =========================
@@ -708,7 +724,7 @@ Task (format output as short sections with bullets):
 # =========================
 with tab_metrics:
     st.markdown("Keep an eye on service health, recent inferences, and training reports.")
-    auto = st.checkbox("Auto-refresh every 10 seconds", value=False)
+    auto = st.checkbox("Auto-refresh every 10 seconds", value=False, key="mtx_autorefresh")  # KEY
     if auto:
         st.markdown("<script>setTimeout(() => window.location.reload(), 10000);</script>", unsafe_allow_html=True)
 
@@ -717,7 +733,7 @@ with tab_metrics:
         st.subheader("Service health")
         try:
             first = (selected_models[0] if selected_models else 'rf')
-            h = requests.get(f"{st.session_state['api_url']}/health", params={"model": first}, timeout=10).json()
+            h = _api_get(f"{st.session_state['api_url']}/health", params={"model": first}, timeout=10)
             ok = h.get("status") == "ok"
             if ok:
                 st.success(h)
@@ -729,7 +745,7 @@ with tab_metrics:
     with c2:
         st.subheader("Recent inferences")
         try:
-            li = requests.get(f"{st.session_state['api_url']}/metrics/last_inferences?limit=10", timeout=10).json()
+            li = _api_get(f"{st.session_state['api_url']}/metrics/last_inferences", params={"limit":10}, timeout=10)
             rows = li.get("rows", [])
             if rows:
                 st.dataframe(pd.DataFrame(rows))
@@ -765,7 +781,7 @@ with tab_advice:
         st.info("Run a single prediction first (any model).")
     else:
         avail = list(results.keys())
-        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0)
+        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0, key="advice_model_pick")  # KEY
         chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
 
         res = results[chosen_key]
@@ -801,7 +817,7 @@ Constraints:
 - Add: 'This is not medical advice; consult your clinician.'
 """
 
-        if st.button("Generate AI next steps"):
+        if st.button("Generate AI next steps", key="btn_ai_next_steps"):  # KEY
             text = call_llm(system_prompt, user_prompt)
             if text:
                 text_html = nl2br(text)
@@ -821,7 +837,8 @@ Constraints:
                     "Download next steps (.txt)",
                     data=text.encode("utf-8"),
                     file_name="ckd_recommendations.txt",
-                    mime="text/plain"
+                    mime="text/plain",
+                    key="dl_next_steps"  # KEY
                 )
                 _log("Recommendations generated.")
             else:
@@ -836,23 +853,22 @@ with tab_digital_twin:
     base = st.session_state.get("last_pred_payload") or {}
     if not base:
         st.info("Run a single prediction first to set a baseline, or paste JSON below.")
-    base_json = st.text_area("Baseline JSON (optional, overrides last single payload if provided)", value=json.dumps(base, indent=2))
-    use_base = {}
-    try:
-        if base_json.strip():
-            use_base = sanitize_payload(json.loads(base_json))
-    except Exception as e:
-        st.error(f"Baseline JSON parse error: {e}")
+    base_json = st.text_area(
+        "Baseline JSON (optional, overrides last single payload if provided)",
+        value=json.dumps(base, indent=2),
+        key="dt_baseline_json"  # KEY
+    )
+    use_base = sanitize_payload(safe_json_loads(base_json, fallback=base or {}))
 
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("**Simple deltas** (applied to baseline)")
-        d_sbp = st.number_input("Δ Systolic BP (mmHg)", -40, 40, 0)
-        d_dbp = st.number_input("Δ Diastolic BP (mmHg)", -30, 30, 0)
-        d_gfr = st.number_input("Δ GFR (mL/min/1.73m²)", -50, 50, 0)
-        d_acr = st.number_input("Δ ACR (mg/g)", -500, 500, 0)
-        d_k   = st.number_input("Δ Potassium (mEq/L)", -2.0, 2.0, 0.0, step=0.1)
-        d_a1c = st.number_input("Δ HbA1c (%)", -3.0, 3.0, 0.0, step=0.1)
+        d_sbp = st.number_input("Δ Systolic BP (mmHg)", -40, 40, 0, key="dt_d_sbp")  # KEY
+        d_dbp = st.number_input("Δ Diastolic BP (mmHg)", -30, 30, 0, key="dt_d_dbp")  # KEY
+        d_gfr = st.number_input("Δ GFR (mL/min/1.73m²)", -50, 50, 0, key="dt_d_gfr")  # KEY
+        d_acr = st.number_input("Δ ACR (mg/g)", -500, 500, 0, key="dt_d_acr")  # KEY
+        d_k   = st.number_input("Δ Potassium (mEq/L)", -2.0, 2.0, 0.0, step=0.1, key="dt_d_k")  # KEY
+        d_a1c = st.number_input("Δ HbA1c (%)", -3.0, 3.0, 0.0, step=0.1, key="dt_d_a1c")  # KEY
         deltas = {
             "systolicbp": d_sbp,
             "diastolicbp": d_dbp,
@@ -863,9 +879,9 @@ with tab_digital_twin:
         }
     with c2:
         st.markdown("**Grid sweep** (comma-separated values)")
-        grid_sbp = st.text_input("SBP list", "120,130,140")
-        grid_gfr = st.text_input("GFR list", "30,45,60,75,90")
-        grid_acr = st.text_input("ACR list", "10,30,300")
+        grid_sbp = st.text_input("SBP list", "120,130,140", key="dt_grid_sbp")  # KEY
+        grid_gfr = st.text_input("GFR list", "30,45,60,75,90", key="dt_grid_gfr")  # KEY
+        grid_acr = st.text_input("ACR list", "10,30,300", key="dt_grid_acr")  # KEY
         grid = {}
         try:
             if grid_sbp.strip():
@@ -877,17 +893,15 @@ with tab_digital_twin:
         except Exception as e:
             st.error(f"Grid parse error: {e}")
 
-    model_for_sim = st.selectbox("Model for simulation", [MODEL_KEYS.get(m,m) for m in MODEL_KEYS], index=1)
+    model_for_sim = st.selectbox("Model for simulation", [MODEL_KEYS.get(m,m) for m in MODEL_KEYS], index=1, key="dt_model_select")  # KEY
     model_key_sim = MODEL_LABELS.get(model_for_sim, "rf")
 
     cA, cB = st.columns(2)
     with cA:
-        if st.button("Run single what-if"):
+        if st.button("Run single what-if", key="btn_dt_single"):  # KEY
             body = {"base": use_base or base, "deltas": deltas, "model": model_key_sim}
             try:
-                r = requests.post(f"{st.session_state['api_url']}/whatif", json=body, timeout=60)
-                r.raise_for_status()
-                out = r.json()
+                out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=60)
                 st.success("Done.")
                 st.json(out)
             except requests.HTTPError as e:
@@ -896,12 +910,10 @@ with tab_digital_twin:
             except Exception as e:
                 st.error(f"What-if error: {e}")
     with cB:
-        if st.button("Run grid sweep"):
+        if st.button("Run grid sweep", key="btn_dt_grid"):  # KEY
             body = {"base": use_base or base, "grid": grid, "model": model_key_sim}
             try:
-                r = requests.post(f"{st.session_state['api_url']}/whatif", json=body, timeout=120)
-                r.raise_for_status()
-                out = r.json()
+                out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=120)
                 st.success("Done.")
                 if isinstance(out, dict) and "rows" in out:
                     st.dataframe(pd.DataFrame(out["rows"]))
@@ -921,29 +933,26 @@ with tab_counterfactuals:
     base = st.session_state.get("last_pred_payload") or {}
     if not base:
         st.info("Run a single prediction first to set a baseline, or paste JSON below.")
-    base_json = st.text_area("Baseline JSON (optional, overrides last single payload if provided)", value=json.dumps(base, indent=2))
-    use_base = {}
-    try:
-        if base_json.strip():
-            use_base = sanitize_payload(json.loads(base_json))
-    except Exception as e:
-        st.error(f"Baseline JSON parse error: {e}")
+    base_json = st.text_area(
+        "Baseline JSON (optional, overrides last single payload if provided)",
+        value=json.dumps(base, indent=2),
+        key="cf_baseline_json"  # KEY
+    )
+    use_base = sanitize_payload(safe_json_loads(base_json, fallback=base or {}))
 
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
-        target_prob = st.number_input("Target prob (≤ this)", 0.0, 1.0, 0.2, step=0.01)
+        target_prob = st.number_input("Target prob (≤ this)", 0.0, 1.0, 0.2, step=0.01, key="cf_target_prob")  # KEY
     with col2:
-        method = st.selectbox("Method", ["auto", "greedy"], index=0)
+        method = st.selectbox("Method", ["auto", "greedy"], index=0, key="cf_method")  # KEY
     with col3:
-        model_for_cf = st.selectbox("Model", [MODEL_KEYS.get(m,m) for m in MODEL_KEYS], index=1)
+        model_for_cf = st.selectbox("Model", [MODEL_KEYS.get(m,m) for m in MODEL_KEYS], index=1, key="cf_model_select")  # KEY
     model_key_cf = MODEL_LABELS.get(model_for_cf, "rf")
 
-    if st.button("Compute counterfactual"):
+    if st.button("Compute counterfactual", key="btn_cf_compute"):  # KEY
         body = {"base": use_base or base, "target_prob": target_prob, "model": model_key_cf, "method": method}
         try:
-            r = requests.post(f"{st.session_state['api_url']}/counterfactual", json=body, timeout=120)
-            r.raise_for_status()
-            out = r.json()
+            out = _api_post(f"{st.session_state['api_url']}/counterfactual", json_body=body, timeout=120)
             st.success("Counterfactual ready.")
             if isinstance(out, dict) and "steps" in out:
                 st.markdown("**Search path**")
@@ -968,18 +977,17 @@ with tab_similarity:
     base = st.session_state.get("last_pred_payload") or {}
     if not base:
         st.info("Run a single prediction first to set a baseline, or paste JSON below.")
-    base_json = st.text_area("Baseline JSON (optional, overrides last single payload if provided)", value=json.dumps(base, indent=2))
-    use_base = {}
-    try:
-        if base_json.strip():
-            use_base = sanitize_payload(json.loads(base_json))
-    except Exception as e:
-        st.error(f"Baseline JSON parse error: {e}")
+    base_json = st.text_area(
+        "Baseline JSON (optional, overrides last single payload if provided)",
+        value=json.dumps(base, indent=2),
+        key="sim_baseline_json"  # KEY
+    )
+    use_base = sanitize_payload(safe_json_loads(base_json, fallback=base or {}))
 
-    cohort_file = st.file_uploader("Upload cohort CSV to search in", type=["csv"])
-    k = st.slider("Top-k similar", 1, 50, 5)
+    cohort_file = st.file_uploader("Upload cohort CSV to search in", type=["csv"], key="sim_file")  # KEY
+    k = st.slider("Top-k similar", 1, 50, 5, key="sim_k")  # KEY
 
-    if st.button("Find similar"):
+    if st.button("Find similar", key="btn_find_similar"):  # KEY
         try:
             cohort = []
             if cohort_file:
@@ -991,10 +999,7 @@ with tab_similarity:
                 dfc = dfc[FEATURE_COLUMNS]
                 cohort = [sanitize_payload(r) for r in dfc.to_dict(orient="records")]
             body = {"base": use_base or base, "cohort": cohort}
-            # POST with Body(...): FastAPI expects JSON body; include k in query
-            r = requests.post(f"{st.session_state['api_url']}/similar?k={k}", json=body, timeout=60)
-            r.raise_for_status()
-            out = r.json()
+            out = _api_post(f"{st.session_state['api_url']}/similar", params={"k": k}, json_body=body, timeout=60)
             st.success("Similar patients computed.")
             if isinstance(out, dict) and "neighbors" in out:
                 st.table(pd.DataFrame(out["neighbors"]))
@@ -1018,7 +1023,7 @@ with tab_agents:
         st.info("Run a single prediction first so we can build the summary for agents.")
     else:
         avail = list(results.keys())
-        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0)
+        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0, key="agents_model_pick")  # KEY
         chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
         res = results[chosen_key]
 
@@ -1045,11 +1050,9 @@ with tab_agents:
             }
         }
 
-        if st.button("Generate care plan (server agents)"):
+        if st.button("Generate care plan (server agents)", key="btn_agents_plan"):  # KEY
             try:
-                r = requests.post(f"{st.session_state['api_url']}/agents/plan", json=summary, timeout=120)
-                r.raise_for_status()
-                out = r.json()
+                out = _api_post(f"{st.session_state['api_url']}/agents/plan", json_body=summary, timeout=120)
                 st.success("Care plan generated.")
                 # Try to render common structure: {sections: [{title, bullets/text}...]}
                 if isinstance(out, dict) and out.get("sections"):
