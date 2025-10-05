@@ -1,6 +1,7 @@
 # ui/app.py
 import os
 import json
+import math
 import requests
 import streamlit as st
 import pandas as pd
@@ -23,8 +24,8 @@ MODEL_CHOICES = [
     ("Random Forest (rf)", "rf"),
     ("Logistic Regression (logreg)", "logreg"),
 ]
-MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}  # label->key
-MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}  # key->label
+MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}   # label -> key
+MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}   # key   -> label
 
 # Optional LLM config (OpenAI-compatible)
 LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")  # openai | together | openrouter | custom
@@ -39,16 +40,38 @@ APP_TITLE = st.secrets.get("APP_TITLE", "CKD Predictor")
 st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
 
 # =========================
-# Helpers
+# Small helpers
 # =========================
+def nl2br(s: str) -> str:
+    """Safe newline-><br/> conversion for HTML blocks (avoid backslashes inside f-strings)."""
+    try:
+        return s.replace("\n", "<br/>")
+    except Exception:
+        return s
+
+def sanitize_payload(d: dict) -> dict:
+    """Make sure no NaN/None leak into JSON."""
+    out = {}
+    for k in FEATURE_COLUMNS:
+        v = d.get(k, 0)
+        if v is None:
+            v = 0.0
+        if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+            v = 0.0
+        out[k] = float(v)
+    return out
+
 def _result_card(label: str, prob_ckd: float, thr: float, model_used: str):
+    # simple colored chip & big numbers
+    bg  = "#fee2e2" if label == "CKD" else "#dcfce7"
+    col = "#991b1b" if label == "CKD" else "#065f46"
     st.markdown(
         f"""
         <div style="padding:14px;border-radius:12px;border:1px solid #e6e6e6;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
             <div style="font-size:18px;font-weight:700;">{MODEL_KEYS.get(model_used, model_used)}</div>
             <div style="font-size:14px;font-weight:700;">
-              <span style="padding:2px 8px;border-radius:999px;background:{'#fee2e2' if label=='CKD' else '#dcfce7'};color:{'#991b1b' if label=='CKD' else '#065f46'}">
+              <span style="padding:2px 8px;border-radius:999px;background:{bg};color:{col}">
                 {label}
               </span>
             </div>
@@ -84,7 +107,8 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=60)
         if r.status_code != 200:
-            st.error("LLM request failed. Check your key/limits.")
+            st.error(f"LLM request failed: {r.status_code}")
+            st.code(r.text, language="json")
             return None
         data = r.json()
         return data.get("choices", [{}])[0].get("message", {}).get("content", None)
@@ -203,7 +227,7 @@ with top_left:
                     _log(f"Health OK • model={h.get('model')} thr={h.get('threshold')}")
                 else:
                     st.warning("Check API", icon="⚠️")
-                    _log("Health WARN: API returned non-ok status.")
+                    _log(f"Health WARN: {h}")
             except Exception as e:
                 st.error("API not reachable", icon="🛑")
                 _log(f"Health ERROR: {e}")
@@ -211,13 +235,12 @@ with top_left:
     with cB:
         if st.button("Rebuild models", use_container_width=True):
             try:
-                r = requests.post(f"{API_URL}/admin/retrain", timeout=10).json()
-                if r.get("status") == "started":
+                r = requests.post(f"{API_URL}/admin/retrain", timeout=10)
+                if r.status_code in (200, 202):
                     st.success("Retrain started", icon="🛠️")
-                    _log("Retrain triggered (background).")
                 else:
-                    st.info("Retrain request accepted.", icon="ℹ️")
-                    _log(f"Retrain response: {r}")
+                    st.info(f"Retrain request returned {r.status_code}", icon="ℹ️")
+                _log(f"Retrain response: {getattr(r, 'text', '')[:120]}")
             except Exception as e:
                 st.error("Failed to start retrain", icon="🛑")
                 _log(f"Retrain ERROR: {e}")
@@ -301,6 +324,8 @@ with tab_single:
             "ckdstage": ckdstage, "albuminuriacat": albuminuriacat,
             "bp_risk": bp_risk, "hyperkalemiaflag": hyperkalemiaflag, "anemiaflag": anemiaflag
         }
+        payload = sanitize_payload(payload)
+
         st.session_state["last_pred_payload"] = payload
         st.session_state["last_pred_results"] = {}
 
@@ -314,13 +339,18 @@ with tab_single:
                 label = "CKD" if res.get("prediction", 1) == 1 else "Non-CKD"
                 with cols[idx]:
                     _result_card(label, float(res.get("prob_ckd", 0.0)), float(res.get("threshold_used", 0.5)), res.get("model_used", m))
-            except Exception as e:
+            except requests.HTTPError as e:
                 with cols[idx]:
                     st.error(f"{MODEL_KEYS.get(m,m)} failed")
+                    st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+                _log(f"Single predict HTTP ERROR ({m}): {e}")
+            except Exception as e:
+                with cols[idx]:
+                    st.error(f"{MODEL_KEYS.get(m,m)} error")
                     st.caption(str(e))
                 _log(f"Single predict ERROR ({m}): {e}")
 
-        # Explainability row (per selected model), compact + robust
+        # Explainability row (per selected model)
         st.markdown("#### Explain prediction (top drivers)")
         ecols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
@@ -331,35 +361,36 @@ with tab_single:
                     try:
                         er = requests.post(f"{API_URL}/explain", params={"model": m}, json=payload, timeout=45)
                         if er.status_code == 404:
-                            st.info("API has no /explain yet.")
-                            _log(f"Explain skipped ({m}): 404 not found.")
+                            st.info("API has no /explain endpoint.")
+                            _log(f"Explain skipped ({m}): 404")
                             continue
                         er.raise_for_status()
                         exp = er.json()
-                        top = exp.get("top", [])
+                        top = exp.get("top") or []
                         if not top:
-                            shap_map = exp.get("shap_values", {})
+                            shap_map = exp.get("shap_values", {}) or {}
                             top = sorted(
                                 [{"feature": k, "impact": abs(v), "signed": v} for k, v in shap_map.items()],
                                 key=lambda x: x["impact"], reverse=True
                             )[:8]
                         if top:
                             df_top = pd.DataFrame(top)
+                            # ensure numeric
                             if "impact" not in df_top.columns and "signed" in df_top.columns:
                                 df_top["impact"] = df_top["signed"].abs()
+                            # bar chart
                             st.bar_chart(df_top.set_index("feature")["impact"])
-                            st.markdown(
-                                "\n".join([
-                                    f"- **{row['feature']}** {'↑' if row.get('signed',0)>0 else '↓'} risk (SHAP={row.get('signed',0):+.3f})"
-                                    for row in top[:5]
-                                ])
+                            bullets = "\n".join(
+                                f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (SHAP={float(row.get('signed',0)):+.3f})"
+                                for row in top[:5]
                             )
+                            st.markdown(bullets)
                         else:
                             st.info("No features available.")
                         _log(f"Explain OK ({m}).")
                     except requests.HTTPError as e:
                         st.error("Explain failed")
-                        st.caption(getattr(e, 'response', None) and e.response.text)
+                        st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
                         _log(f"Explain HTTP ERROR ({m}): {e}")
                     except Exception as e:
                         st.error("Explain error")
@@ -406,7 +437,9 @@ with tab_batch:
                     summary_rows = []
                     for m in selected_models:
                         try:
-                            rows = df.to_dict(orient="records")
+                            rows = df[FEATURE_COLUMNS].to_dict(orient="records")
+                            # sanitize rows
+                            rows = [sanitize_payload(r) for r in rows]
                             r = requests.post(
                                 f"{API_URL}/predict/batch",
                                 params={"model": m},
@@ -431,7 +464,7 @@ with tab_batch:
                             _log(f"Batch OK ({m}) rows={len(preds)}")
                         except requests.HTTPError as e:
                             st.error(f"{MODEL_KEYS.get(m,m)} failed")
-                            st.caption(getattr(e, 'response', None) and e.response.text)
+                            st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
                             _log(f"Batch HTTP ERROR ({m}): {e}")
                         except Exception as e:
                             st.error(f"{MODEL_KEYS.get(m,m)} error")
@@ -466,13 +499,13 @@ with tab_batch:
 
                         if retrain_after_batch:
                             try:
-                                rr = requests.post(f"{API_URL}/admin/retrain", timeout=10).json()
-                                if rr.get("status") == "started":
+                                rr = requests.post(f"{API_URL}/admin/retrain", timeout=10)
+                                if rr.status_code in (200, 202):
                                     st.success("Retraining started. Check Health above.")
                                     _log("Retrain triggered after batch.")
                                 else:
-                                    st.info("Retrain request sent.")
-                                    _log(f"Retrain response after batch: {rr}")
+                                    st.info(f"Retrain request sent ({rr.status_code}).")
+                                    _log(f"Retrain response after batch: {getattr(rr,'text','')[:120]}")
                             except Exception as e:
                                 st.error("Retrain call failed.")
                                 st.caption(str(e))
@@ -480,7 +513,7 @@ with tab_batch:
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
 
-    # --- Cohort insights (AI) — compact card, cached ---
+    # --- Cohort insights (AI) ---
     st.markdown("#### Cohort insights (AI)")
     available_models = list(st.session_state.get("batch_preds", {}).keys())
     if not available_models:
@@ -532,6 +565,7 @@ Task (format output as short sections with bullets):
                 _log("Cohort insights cleared.")
 
         if st.session_state["batch_insights"]:
+            insights_html = nl2br(st.session_state["batch_insights"])
             st.markdown(
                 f"""
                 <div style="border:1px solid #e6e6e6;border-radius:12px;padding:16px;background:#fafafa">
@@ -539,7 +573,7 @@ Task (format output as short sections with bullets):
                     <div style="font-weight:700">Cohort Insights — {MODEL_KEYS.get(chosen_m, chosen_m)}</div>
                     <div style="font-size:12px;color:#666">Positive rate {pos_rate:.1%} • Avg Prob_CKD {avg_prob:.3f} • Rows {len(preds)}</div>
                   </div>
-                  <div style="line-height:1.55">{st.session_state["batch_insights"].replace('\n','<br/>')}</div>
+                  <div style="line-height:1.55">{insights_html}</div>
                 </div>
                 """,
                 unsafe_allow_html=True
@@ -653,6 +687,7 @@ Constraints:
         if st.button("Generate recommendations"):
             text = call_llm(system_prompt, user_prompt)
             if text:
+                text_html = nl2br(text)
                 st.markdown(
                     f"""
                     <div style="border:1px solid #e6e6e6;border-radius:12px;padding:16px;background:#fafafa">
@@ -660,7 +695,7 @@ Constraints:
                         <div style="font-weight:700">Recommendations — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
                         <div style="font-size:12px;color:#666">Label: {label} • Prob_CKD {prob_ckd:.3f}</div>
                       </div>
-                      <div style="line-height:1.55">{text.replace('\n','<br/>')}</div>
+                      <div style="line-height:1.55">{text_html}</div>
                     </div>
                     """,
                     unsafe_allow_html=True
