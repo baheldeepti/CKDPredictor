@@ -8,18 +8,24 @@ from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
+from joblib import load
+from pydantic import BaseModel, Field
+
 from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
-from joblib import load
+from fastapi.middleware.cors import CORSMiddleware
 
 # Optional DB logging (safe if DATABASE_URL is unset)
 from sqlalchemy import create_engine, text
-from fastapi.middleware.cors import CORSMiddleware
+
+# -----------------------------------------------------------------------------
+# App (instantiate first) + CORS
+# -----------------------------------------------------------------------------
+app = FastAPI(title="CKD Predictor API", version="0.6.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or specify Streamlit domain later
+    allow_origins=["*"],   # tighten later if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -97,20 +103,23 @@ class BatchPredictRequest(BaseModel):
 class BatchPredictResponse(BaseModel):
     predictions: List[PredictResponse]
 
-# -----------------------------------------------------------------------------
-# App + Model cache
-# -----------------------------------------------------------------------------
+class ExplainResponse(BaseModel):
+    base_value: float
+    shap_values: Dict[str, float]   # feature -> signed impact
+    top: List[Dict[str, float]]     # list of {feature, impact, signed}
 
-app = FastAPI(title="CKD Predictor API", version="0.5.0")
+# -----------------------------------------------------------------------------
+# Model cache
+# -----------------------------------------------------------------------------
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
 
 def _load_artifacts(model_key: str) -> Tuple[object, float, bool]:
-    model_key = model_key.lower()
-    if model_key not in REGISTRY:
+    mk = model_key.lower()
+    if mk not in REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown model '{model_key}'. Use one of {list(REGISTRY)}")
-    paths = REGISTRY[model_key]
+    paths = REGISTRY[mk]
     if not paths["model"].exists():
-        raise HTTPException(status_code=400, detail=f"Model file missing for '{model_key}'. Train it first.")
+        raise HTTPException(status_code=400, detail=f"Model file missing for '{mk}'. Train it first.")
     mdl = load(paths["model"])
     thr = 0.5
     if paths["thr"].exists():
@@ -126,26 +135,28 @@ def get_model_and_thr(model_key: str) -> Tuple[object, float, bool]:
     d = _cache[model_key]
     return d["model"], d["thr"], d["flip"]
 
-def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
-    # validate columns & order
+# -----------------------------------------------------------------------------
+# Core prediction
+# -----------------------------------------------------------------------------
+
+def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
     for c in FEATURE_COLS:
         if c not in df.columns:
             raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
-    df = df[FEATURE_COLS].copy()
+    return df[FEATURE_COLS].copy()
 
+def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
+    df = _validate_and_order(df)
     mdl, thr, flip = get_model_and_thr(model_key)
 
-    # Probabilities
     proba1 = mdl.predict_proba(df)[:, 1]  # standard: P(CKD)
     if flip:
         # Legacy XGB path: proba1 is actually P(Non-CKD)
         prob_non_ckd = proba1
         prob_ckd = 1.0 - proba1
-        # Threshold tuned on P(non-CKD) -> class 0 if prob_non_ckd >= thr
         pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 means "Non-CKD"
-        prediction = np.where(pred_class0 == 1, 0, 1)    # convert to original labels
+        prediction = np.where(pred_class0 == 1, 0, 1)    # 0/1 in original labels
     else:
-        # Standard path: proba1 is P(CKD)
         prob_ckd = proba1
         prob_non_ckd = 1.0 - proba1
         prediction = (prob_ckd >= thr).astype(int)       # 1 means CKD
@@ -293,6 +304,58 @@ def last_inferences(limit: int = Query(10, ge=1, le=100)):
             LIMIT :limit
         """), {"limit": limit}).mappings().all()
     return {"rows": [dict(r) for r in rows]}
+
+# === Explainability ==========================================================
+
+@app.post("/explain", response_model=ExplainResponse)
+def explain(
+    item: PatientFeatures,
+    model: str = Query("xgb"),
+):
+    """
+    SHAP explanation for a single row.
+    Returns base_value, per-feature signed shap values, and top features by |impact|.
+    """
+    try:
+        import shap  # uses shap.Explainer which auto-picks model type (tree/linear/kernel)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SHAP not available: {e}")
+
+    df = pd.DataFrame([item.dict()])
+    df = _validate_and_order(df)
+    mdl, _, _ = get_model_and_thr(model)
+
+    try:
+        explainer = shap.Explainer(mdl)     # works for tree/linear/sklearn pipelines
+        sv = explainer(df)                  # shap.Explanation
+        base = float(np.array(sv.base_values)[0])
+        vals = np.array(sv.values)[0]       # per-feature shap values
+    except Exception as e:
+        # fallback: TreeExplainer for tree models
+        try:
+            explainer = shap.TreeExplainer(mdl)
+            sv = explainer.shap_values(df)
+            # For binary classification, shap_values may be list [class0, class1]; take class1
+            if isinstance(sv, list) and len(sv) == 2:
+                vals = np.array(sv[1][0])
+            else:
+                vals = np.array(sv[0])
+            base = float(explainer.expected_value[1] if isinstance(explainer.expected_value, (list, tuple)) else explainer.expected_value)
+        except Exception as ee:
+            raise HTTPException(status_code=500, detail=f"Failed to compute SHAP values: {e}; fallback error: {ee}")
+
+    shap_map = {feat: float(v) for feat, v in zip(FEATURE_COLS, vals)}
+    top_sorted = sorted(
+        [{"feature": f, "impact": abs(v), "signed": float(v)} for f, v in shap_map.items()],
+        key=lambda x: x["impact"],
+        reverse=True
+    )[:8]
+
+    return {
+        "base_value": base,
+        "shap_values": shap_map,
+        "top": top_sorted,
+    }
 
 # === Retrain / Reload =======================================================
 
