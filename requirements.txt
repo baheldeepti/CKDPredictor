@@ -14,3 +14,4 @@ requests==2.32.3
 shap==0.44.1
 matplotlib==3.9.2
 numba==0.60.0
+altair>=5.4.1      # Streamlit built-in charts rely on it; keeps bar charts happy
