@@ -9,8 +9,13 @@ import pandas as pd
 # =========================
 # Config
 # =========================
-API_URL_DEFAULT = "http://0.0.0.0:8000"
-API_URL = st.secrets.get("API_URL", API_URL_DEFAULT)
+# Prefer your Render API; allow override via Secrets or env.
+API_URL_DEFAULT = "https://ckdpredictor.onrender.com"
+API_URL = (
+    st.secrets.get("API_URL")
+    or os.environ.get("CKD_API_URL")
+    or API_URL_DEFAULT
+)
 
 FEATURE_COLUMNS = [
     "age","gender","systolicbp","diastolicbp","serumcreatinine","bunlevels",
@@ -24,8 +29,8 @@ MODEL_CHOICES = [
     ("Random Forest (rf)", "rf"),
     ("Logistic Regression (logreg)", "logreg"),
 ]
-MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}   # label -> key
-MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}   # key   -> label
+MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}
+MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}
 
 # Optional LLM config (OpenAI-compatible)
 LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")  # openai | together | openrouter | custom
@@ -40,17 +45,15 @@ APP_TITLE = st.secrets.get("APP_TITLE", "CKD Predictor")
 st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
 
 # =========================
-# Small helpers
+# Helpers
 # =========================
 def nl2br(s: str) -> str:
-    """Safe newline-><br/> conversion for HTML blocks (avoid backslashes inside f-strings)."""
     try:
         return s.replace("\n", "<br/>")
     except Exception:
         return s
 
 def sanitize_payload(d: dict) -> dict:
-    """Make sure no NaN/None leak into JSON."""
     out = {}
     for k in FEATURE_COLUMNS:
         v = d.get(k, 0)
@@ -62,7 +65,6 @@ def sanitize_payload(d: dict) -> dict:
     return out
 
 def _result_card(label: str, prob_ckd: float, thr: float, model_used: str):
-    # simple colored chip & big numbers
     bg  = "#fee2e2" if label == "CKD" else "#dcfce7"
     col = "#991b1b" if label == "CKD" else "#065f46"
     st.markdown(
@@ -146,8 +148,8 @@ def call_llm(system_prompt: str, user_prompt: str):
 
 def derive_flags_and_bins(systolicbp, diastolicbp, potassium, hb, gfr, acr):
     bp_risk = 1 if (systolicbp >= 130 or diastolicbp >= 80) else 0
-    hyperk = 1 if potassium >= 5.5 else 0
-    anemia = 1 if hb < 12.0 else 0
+    hyperk  = 1 if potassium >= 5.5 else 0
+    anemia  = 1 if hb < 12.0 else 0
 
     if gfr >= 90: stage = 1
     elif gfr >= 60: stage = 2
@@ -178,25 +180,22 @@ def sample_records_df():
 if "last_pred_payload" not in st.session_state:
     st.session_state["last_pred_payload"] = None
 if "last_pred_results" not in st.session_state:
-    st.session_state["last_pred_results"] = {}  # per-model
+    st.session_state["last_pred_results"] = {}
 if "batch_preds" not in st.session_state:
-    st.session_state["batch_preds"] = {}        # per-model DataFrame
+    st.session_state["batch_preds"] = {}
 if "batch_insights" not in st.session_state:
     st.session_state["batch_insights"] = None
 if "activity_log" not in st.session_state:
-    st.session_state["activity_log"] = []       # simple strings
+    st.session_state["activity_log"] = []
 
 def _log(msg: str):
     st.session_state["activity_log"].append(msg)
 
 # =========================
-# Header + Primary Controls
+# Header + Controls
 # =========================
 st.title("🩺 CKD Predictor")
-st.caption(
-    "Enterprise-grade demo: single & batch predictions, **multi-model comparison**, SHAP explainability, "
-    "DB-backed metrics, and polished AI cohort insights."
-)
+st.caption("Single & batch predictions, **multi-model comparison**, SHAP explainability, DB metrics, and AI cohort insights.")
 
 top_left, top_right = st.columns([3, 2])
 with top_left:
@@ -204,15 +203,15 @@ with top_left:
     picked_labels = st.multiselect(
         "Select models to use",
         model_labels,
-        default=[model_labels[0]],
+        default=[model_labels[1]],  # default RF
         help="Pick one or more models. We'll compare outputs side-by-side."
     )
-    selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["xgb"]
+    selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["rf"]
 
     st.markdown(
         "<div style='font-size:12px;color:#666;margin-top:-6px'>"
-        "<b>Rebuild models</b> retrains on the server (uses historical inputs if DB logging is enabled). "
-        "<b>Reload models</b> clears the API's in-memory cache to pick up fresh artifacts."
+        "<b>Rebuild models</b> retrains on the server. "
+        "<b>Reload models</b> clears the API cache to pick up fresh artifacts."
         "</div>",
         unsafe_allow_html=True
     )
@@ -224,9 +223,9 @@ with top_left:
                 h = requests.get(f"{API_URL}/health", params={"model": selected_models[0]}, timeout=10).json()
                 if h.get("status") == "ok":
                     st.success("Healthy", icon="✅")
-                    _log(f"Health OK • model={h.get('model')} thr={h.get('threshold')}")
+                    _log(f"Health OK • model={h.get('model')} thr={h.get('threshold')} db={h.get('db_backend')}")
                 else:
-                    st.warning("Check API", icon="⚠️")
+                    st.warning(h, icon="⚠️")
                     _log(f"Health WARN: {h}")
             except Exception as e:
                 st.error("API not reachable", icon="🛑")
@@ -239,8 +238,8 @@ with top_left:
                 if r.status_code in (200, 202):
                     st.success("Retrain started", icon="🛠️")
                 else:
-                    st.info(f"Retrain request returned {r.status_code}", icon="ℹ️")
-                _log(f"Retrain response: {getattr(r, 'text', '')[:120]}")
+                    st.info(f"Retrain returned {r.status_code}", icon="ℹ️")
+                _log(f"Retrain response: {getattr(r, 'text', '')[:200]}")
             except Exception as e:
                 st.error("Failed to start retrain", icon="🛑")
                 _log(f"Retrain ERROR: {e}")
@@ -275,10 +274,10 @@ tab_single, tab_batch, tab_metrics, tab_advice = st.tabs(
 )
 
 # =========================
-# Single prediction (Compare)
+# Single prediction
 # =========================
 with tab_single:
-    st.markdown("Fill the form, then **Predict with selected models**. Compare outputs and explanations side-by-side.")
+    st.markdown("Fill the form, then **Predict with selected models**. Compare outputs and explanations.")
     with st.form("predict_form", border=True):
         col1, col2 = st.columns(2)
         with col1:
@@ -350,7 +349,7 @@ with tab_single:
                     st.caption(str(e))
                 _log(f"Single predict ERROR ({m}): {e}")
 
-        # Explainability row (per selected model)
+        # Explainability per selected model
         st.markdown("#### Explain prediction (top drivers)")
         ecols = st.columns(len(selected_models))
         for idx, m in enumerate(selected_models):
@@ -375,10 +374,8 @@ with tab_single:
                             )[:8]
                         if top:
                             df_top = pd.DataFrame(top)
-                            # ensure numeric
                             if "impact" not in df_top.columns and "signed" in df_top.columns:
                                 df_top["impact"] = df_top["signed"].abs()
-                            # bar chart
                             st.bar_chart(df_top.set_index("feature")["impact"])
                             bullets = "\n".join(
                                 f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (SHAP={float(row.get('signed',0)):+.3f})"
@@ -398,7 +395,7 @@ with tab_single:
                         _log(f"Explain ERROR ({m}): {e}")
 
 # =========================
-# Batch predictions (Compare)
+# Batch predictions
 # =========================
 with tab_batch:
     st.markdown("Upload a CSV, run batch predictions across **all selected models**, and compare metrics.")
@@ -417,11 +414,7 @@ with tab_batch:
                            file_name="ckd_sample_5rows.csv", mime="text/csv")
 
     file = st.file_uploader("Upload CSV", type=["csv"])
-    retrain_after_batch = st.checkbox(
-        "Retrain after batch",
-        value=False,
-        help="Optionally kick off server-side retraining after this batch finishes."
-    )
+    retrain_after_batch = st.checkbox("Retrain after batch", value=False)
 
     if file:
         try:
@@ -438,7 +431,6 @@ with tab_batch:
                     for m in selected_models:
                         try:
                             rows = df[FEATURE_COLUMNS].to_dict(orient="records")
-                            # sanitize rows
                             rows = [sanitize_payload(r) for r in rows]
                             r = requests.post(
                                 f"{API_URL}/predict/batch",
@@ -476,7 +468,6 @@ with tab_batch:
                         st.markdown("#### Model comparison (batch summary)")
                         st.table(pd.DataFrame(summary_rows))
 
-                        # Downloads per model and merged comparison
                         merged_list = []
                         for m, preds in st.session_state["batch_preds"].items():
                             merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
@@ -505,7 +496,7 @@ with tab_batch:
                                     _log("Retrain triggered after batch.")
                                 else:
                                     st.info(f"Retrain request sent ({rr.status_code}).")
-                                    _log(f"Retrain response after batch: {getattr(rr,'text','')[:120]}")
+                                    _log(f"Retrain response after batch: {getattr(rr,'text','')[:200]}")
                             except Exception as e:
                                 st.error("Retrain call failed.")
                                 st.caption(str(e))
@@ -513,7 +504,7 @@ with tab_batch:
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
 
-    # --- Cohort insights (AI) ---
+    # Cohort insights (AI)
     st.markdown("#### Cohort insights (AI)")
     available_models = list(st.session_state.get("batch_preds", {}).keys())
     if not available_models:
@@ -557,7 +548,7 @@ Task (format output as short sections with bullets):
                     st.session_state["batch_insights"] = text
                     _log("Cohort insights generated.")
                 else:
-                    st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
+                    st.error("LLM did not return text. Check the key/credits.")
                     _log("Cohort insights FAILED.")
         with c2:
             if st.button("Clear cached summary"):
@@ -598,7 +589,7 @@ with tab_metrics:
     with c1:
         st.subheader("Service health")
         try:
-            first = (selected_models[0] if selected_models else 'xgb')
+            first = (selected_models[0] if selected_models else 'rf')
             h = requests.get(f"{API_URL}/health", params={"model": first}, timeout=10).json()
             ok = h.get("status") == "ok"
             if ok:
@@ -629,78 +620,3 @@ with tab_metrics:
             st.info("No retrain report found. Click **Rebuild models** at top, then **Reload models**.")
     except Exception as e:
         st.error(f"Report fetch failed: {e}")
-
-# =========================
-# Recommendations (alpha)
-# =========================
-with tab_advice:
-    st.markdown(
-        "AI-assisted recommendations for the **last single prediction**. "
-        "Interprets stage, albuminuria, and flags. No medication dosing. "
-        "_This is not medical advice._"
-    )
-
-    payload = st.session_state.get("last_pred_payload")
-    results = st.session_state.get("last_pred_results", {})
-
-    if not payload or not results:
-        st.info("Run a single prediction first (any model).")
-    else:
-        avail = list(results.keys())
-        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0)
-        chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
-
-        res = results[chosen_key]
-        label = "CKD" if res.get("prediction", 1) == 1 else "Non-CKD"
-        prob_ckd = float(res.get("prob_ckd", 0.0))
-        stage = int(payload["ckdstage"])
-        alb = int(payload["albuminuriacat"])
-        bp_risk = int(payload["bp_risk"])
-        hyperk = int(payload["hyperkalemiaflag"])
-        anemia = int(payload["anemiaflag"])
-
-        system_prompt = (
-            "You are a multi-agent coordinator for kidney risk recommendations. "
-            "Agents: medical_analyst, diet_specialist, exercise_coach, care_coordinator. "
-            "Use cautious tone. No medication dosing. Always include a 'Not medical advice' disclaimer."
-        )
-
-        user_prompt = f"""
-Prediction summary (model: {MODEL_KEYS.get(chosen_key, chosen_key)}):
-- Label: {label}
-- Prob_CKD: {prob_ckd:.3f}
-- CKD Stage (from GFR): {stage}
-- Albuminuria Category (from ACR): {alb}
-- Flags: BP_Risk={bp_risk}, Hyperkalemia={hyperk}, Anemia={anemia}
-
-Task:
-1) medical_analyst: interpret stage/albuminuria and red flags (e.g., potassium ≥6.0).
-2) diet_specialist: stage- and ACR-aware guidance (protein, sodium, potassium).
-3) exercise_coach: moderate plan; contraindications if anemia/hyperkalemia present.
-4) care_coordinator: suggest lab follow-ups (e.g., repeat ACR), timing, non-directive med chats (ACEi/ARB note).
-
-Constraints:
-- No medication dosing.
-- Include a short, readable 'next steps' list.
-- Add: 'This is not medical advice; consult your clinician.'
-"""
-        if st.button("Generate recommendations"):
-            text = call_llm(system_prompt, user_prompt)
-            if text:
-                text_html = nl2br(text)
-                st.markdown(
-                    f"""
-                    <div style="border:1px solid #e6e6e6;border-radius:12px;padding:16px;background:#fafafa">
-                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                        <div style="font-weight:700">Recommendations — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
-                        <div style="font-size:12px;color:#666">Label: {label} • Prob_CKD {prob_ckd:.3f}</div>
-                      </div>
-                      <div style="line-height:1.55">{text_html}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-                _log("Recommendations generated.")
-            else:
-                st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
-                _log("Recommendations FAILED.")
