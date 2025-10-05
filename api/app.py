@@ -12,7 +12,9 @@ from fastapi import FastAPI, HTTPException, Query, status, BackgroundTasks
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from joblib import load
-from sqlalchemy import create_engine, text  # optional DB logging; safe if DATABASE_URL unset
+
+# Optional DB logging (safe if DATABASE_URL is unset)
+from sqlalchemy import create_engine, text
 
 # -----------------------------------------------------------------------------
 # Configuration
