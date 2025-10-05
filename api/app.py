@@ -23,7 +23,7 @@ from sqlalchemy import create_engine, text
 # -----------------------------------------------------------------------------
 # App (instantiate FIRST) + CORS
 # -----------------------------------------------------------------------------
-app = FastAPI(title="CKD Predictor API", version="0.8.0")
+app = FastAPI(title="CKD Predictor API", version="0.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,10 +43,10 @@ def root():
 # -----------------------------------------------------------------------------
 
 # Base paths
-BASE_DIR = Path(__file__).resolve().parent           # .../api
+BASE_DIR = Path(__file__).resolve().parent                 # .../api
 MODEL_DIR = Path(os.getenv("MODEL_DIR") or (BASE_DIR.parent / "models"))  # .../<repo_root>/models
 
-# Optional: print where we're loading models from
+# Optional: log where we're loading models from
 print(f"[boot] MODEL_DIR={MODEL_DIR.resolve()} exists={MODEL_DIR.exists()}")
 
 # If your *older* XGBoost model (pre-ml/99_retrain.py) exposed proba[:,1] as P(non-CKD),
@@ -272,7 +272,7 @@ def _shap_top_k(features: pd.DataFrame, model, k: int = 6):
         try:
             # Linear models (logreg, etc.)
             from sklearn.linear_model import LogisticRegression  # noqa: F401
-            if model.__class__.__name__.lower().startswith(("logisticregression", "sgdclassifier", "linearsvc")):
+            if model.__class__.__name__.lower().startswith(("logisticregression", "sgdclassifier", "linearsvc", "linear")):
                 mask = shap.maskers.Independent(X)
                 explainer = shap.LinearExplainer(model, mask)
         except Exception:
