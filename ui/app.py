@@ -450,41 +450,52 @@ Task:
             )
 
 # ---- Metrics ----------------------------------------------------------------
+# ---- Metrics ----------------------------------------------------------------
 with tab_metrics:
     st.markdown("**Use this tab to monitor the service and the last retrain.**")
 
+    # Optional auto refresh
+    auto = st.checkbox("Auto-refresh every 10s", value=False)
+    if auto:
+        st.experimental_rerun  # no-op placeholder for IDEs
+        st_autorefresh = st.experimental_rerun if False else None
+        st.markdown(
+            "<script>setTimeout(() => window.location.reload(), 10000);</script>",
+            unsafe_allow_html=True
+        )
+
     c1, c2 = st.columns(2)
     with c1:
-        st.write("**Current Health**")
+        st.subheader("Service health")
         try:
             h = requests.get(f"{api_url}/health", params={"model": model_key}, timeout=10).json()
-            st.json(h)
+            ok = h.get("status") == "ok"
+            st.success(h) if ok else st.warning(h)
         except Exception as e:
             st.error(f"Health failed: {e}")
 
     with c2:
-        st.write("**Recent Inferences**")
+        st.subheader("Recent inferences")
         try:
             li = requests.get(f"{api_url}/metrics/last_inferences?limit=10", timeout=10).json()
             rows = li.get("rows", [])
             if rows:
                 st.dataframe(pd.DataFrame(rows))
             else:
-                st.info("No inferences found yet.")
+                st.info("No inferences found yet — submit a few predictions in Single/Batch tabs.")
         except Exception as e:
             st.error(f"Fetch failed: {e}")
 
-    st.write("**Model status (last retrain)**")
+    st.subheader("Model status (last retrain)")
     try:
         rr = requests.get(f"{api_url}/metrics/retrain_report", timeout=10)
         if rr.status_code == 200:
-            data = rr.json()
-            # Expecting: {"at":"ISO time","by":"ci","models":{"xgb":{...},"rf":{...},...}}
-            st.json(data)
+            st.json(rr.json())
         else:
-            st.info("No retrain report found.")
+            st.info("No retrain report found. Click **Rebuild models now** in the left sidebar, then **Reload models**.")
     except Exception as e:
         st.error(f"Report fetch failed: {e}")
+
 
 # ---- Recommendations (alpha) ------------------------------------------------
 with tab_advice:
