@@ -2,7 +2,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -22,7 +22,7 @@ except Exception:
 ROOT_DIR = Path(__file__).resolve().parents[1]     # repo root
 MODEL_DIR = Path(os.getenv("MODEL_DIR") or (ROOT_DIR / "models"))
 
-REGISTRY = {
+REGISTRY: Dict[str, Dict[str, Any]] = {
     "xgb": {
         "model": MODEL_DIR / "xgb_ckd.joblib",
         "thr":   MODEL_DIR / "xgb_ckd_threshold.json",
@@ -55,7 +55,7 @@ FEATURE_COLS: List[str] = [
 # ---------------------------------------------------------------------------
 # Utilities: loading, validation, derived feature computation
 # ---------------------------------------------------------------------------
-def _load_artifacts(model_key: str):
+def _load_artifacts(model_key: str) -> Tuple[Any, float, bool]:
     mk = model_key.lower()
     if mk not in REGISTRY:
         raise ValueError(f"Unknown model '{model_key}'. Use one of {list(REGISTRY)}")
@@ -110,7 +110,7 @@ def _derive_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     row["hyperkalemiaflag"] = 1 if k >= 5.5 else 0
     row["anemiaflag"] = 1 if hb < 12.0 else 0
 
-    # Keep Na within plausible range
+    # Keep plausible ranges
     row["serumelectrolytessodium"] = float(np.clip(na, 110.0, 170.0))
     row["serumelectrolytespotassium"] = float(np.clip(k, 2.0, 7.5))
     return row
@@ -133,20 +133,20 @@ def _predict_prob_ckd(model, df: pd.DataFrame, flip: bool) -> np.ndarray:
 # Define which features are "actionable" and the direction toward lower risk.
 # Each entry: (name, step_size, direction, min, max)
 #   direction: +1 means increasing should reduce risk; -1 means decreasing helps; 0 means move toward target
-_ACTIONABLES = [
-    ("systolicbp",               2.0,  -1,  90.0, 200.0),
-    ("diastolicbp",              2.0,  -1,  50.0, 120.0),
-    ("hba1c",                    0.2,  -1,   4.5,  12.0),
-    ("acr",                     10.0,  -1,   0.0, 3000.0),
-    ("bunlevels",                1.0,  -1,   3.0,  90.0),
-    ("serumcreatinine",          0.1,  -1,   0.4,  8.0),
-    ("serumelectrolytespotassium", 0.1,  0,   3.0,  6.5),   # toward ~4.5
-    ("serumelectrolytessodium",   0.5,  0, 130.0, 150.0),   # toward ~140
-    ("hemoglobinlevels",         0.2,  +1,   8.0,  16.0),   # higher generally reduces anemia flag
-    ("gfr",                      1.0,  +1,  10.0, 110.0),
+_ACTIONABLES: List[Tuple[str, float, int, float, float]] = [
+    ("systolicbp",                 2.0, -1,  90.0, 200.0),
+    ("diastolicbp",                2.0, -1,  50.0, 120.0),
+    ("hba1c",                      0.2, -1,   4.5,  12.0),
+    ("acr",                       10.0, -1,   0.0, 3000.0),
+    ("bunlevels",                  1.0, -1,   3.0,   90.0),
+    ("serumcreatinine",            0.1, -1,   0.4,    8.0),
+    ("serumelectrolytespotassium", 0.1,  0,   3.0,   6.5),   # toward ~4.5
+    ("serumelectrolytessodium",    0.5,  0, 130.0, 150.0),   # toward ~140
+    ("hemoglobinlevels",           0.2, +1,   8.0,   16.0),  # higher generally reduces anemia flag
+    ("gfr",                        1.0, +1,  10.0,  110.0),
 ]
 
-def _toward(current: float, step: float, direction: int, target: float | None = None) -> float:
+def _toward(current: float, step: float, direction: int, target: Optional[float] = None) -> float:
     if direction == -1:
         return current - step
     if direction == +1:
@@ -179,7 +179,7 @@ def _greedy_counterfactual(
         return float(_predict_prob_ckd(model, df, flip)[0])
 
     p0 = prob_of(cur)
-    steps = []
+    steps: List[Dict[str, Any]] = []
     last_p = p0
     converged = False
 
@@ -187,7 +187,7 @@ def _greedy_counterfactual(
     target_k = 4.5
     target_na = 140.0
 
-    for it in range(max_iters):
+    for _ in range(max_iters):
         best_feat = None
         best_delta = 0.0
         best_change = 0.0
@@ -267,11 +267,9 @@ def _dice_counterfactual(
         raise RuntimeError("Set CF_DICE_DATA_CSV to a CSV with training-like rows for DiCE.")
 
     df = pd.read_csv(data_csv)
-    # Minimal schema: all features numeric; outcome is "ckd" (we'll create on the fly using model)
-    # Create a temporary outcome column by scoring the dataset
+
     def score_batch(df_in: pd.DataFrame) -> np.ndarray:
         X = _validate_and_order(df_in.copy())
-        # Assume no flip here (DiCE uses a generic predictor wrapper); prob_ckd ~ [:,1]
         return model.predict_proba(X)[:, 1]
 
     df = df.copy()
@@ -283,7 +281,6 @@ def _dice_counterfactual(
     dice = Dice(d, m, method="random")  # "random" or "kdtree" for continuous features
 
     query_instance = pd.DataFrame([base])[FEATURE_COLS]
-    # Aim for target_prob by asking for the opposite class when current prob > target
     current_prob = float(model.predict_proba(query_instance)[:, 1][0])
     desired_class = 0 if current_prob > target_prob else 1
 
@@ -292,11 +289,10 @@ def _dice_counterfactual(
         total_CFs=total_cfs,
         desired_class=desired_class
     )
-    # Parse DiCE result dataframe
     df_cfs = cfs.cf_examples_list[0].final_cfs_df
     cfs_list = df_cfs[FEATURE_COLS].to_dict(orient="records")
 
-    # score them to include prob_ckd
+    # Score them to include prob_ckd (and re-derive flags)
     scored = []
     for r in cfs_list:
         r2 = _derive_fields(r.copy())
@@ -321,11 +317,11 @@ def counterfactual(req) -> Dict[str, Any]:
     Entry point called by FastAPI layer:
       body: { base: PatientFeatures, target_prob: 0.2, model: "xgb", method: "auto"|"greedy" }
     """
-    payload = req if isinstance(req, dict) else req.dict()
-    base = payload.get("base", {})
-    model_key = str(payload.get("model", "xgb")).lower()
-    target_prob = float(payload.get("target_prob", 0.2))
-    method = str(payload.get("method", "auto")).lower()
+    payload: Dict[str, Any] = req if isinstance(req, dict) else req.dict()
+    base: Dict[str, Any] = payload.get("base", {})
+    model_key: str = str(payload.get("model", "xgb")).lower()
+    target_prob: float = float(payload.get("target_prob", 0.2))
+    method: str = str(payload.get("method", "auto")).lower()
 
     # Sanity: ensure required keys exist in base
     missing = [c for c in FEATURE_COLS if c not in base]
@@ -345,9 +341,8 @@ def counterfactual(req) -> Dict[str, Any]:
         try:
             return _dice_counterfactual(model, base, target_prob, total_cfs=3)
         except Exception as e:
-            # fall back but include note
             greedy = _greedy_counterfactual(model, flip, base, target_prob)
             greedy["note"] = f"DiCE fallback: {e}"
             return greedy
-    else:
-        return _greedy_counterfactual(model, flip, base, target_prob)
+    # Fallback to greedy
+    return _greedy_counterfactual(model, flip, base, target_prob)
