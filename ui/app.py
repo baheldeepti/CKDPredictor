@@ -24,10 +24,14 @@ MODEL_CHOICES = [
 ]
 
 # Optional LLM config (OpenAI-compatible)
-LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")           # openai | together | openrouter | custom
+LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")            # openai | together | openrouter | custom
 LLM_API_KEY  = st.secrets.get("LLM_API_KEY", "")
-LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")  # default to OpenRouter
-LLM_MODEL    = st.secrets.get("LLM_MODEL", "openrouter/auto")         # or any model your gateway supports
+LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
+LLM_MODEL    = st.secrets.get("LLM_MODEL", "openrouter/auto")
+
+# Optional branding for OpenRouter headers (recommended)
+APP_URL   = st.secrets.get("APP_URL", "https://github.com/baheldeepti/CKDPredictor")
+APP_TITLE = st.secrets.get("APP_TITLE", "CKD Predictor")
 
 st.set_page_config(page_title="CKD Predictor", page_icon="🩺", layout="wide")
 
@@ -53,11 +57,52 @@ def _result_card(label: str, prob_ckd: float, thr: float, model_used: str):
         unsafe_allow_html=True,
     )
 
-def call_llm(system_prompt: str, user_prompt: str):
-    """Minimal OpenAI-compatible client; works with OpenAI/Together/OpenRouter/base_url gateways."""
+def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
+    """Direct OpenRouter call with required headers."""
     if not LLM_API_KEY:
-        st.warning("No LLM API key configured. Add LLM_API_KEY (and optionally LLM_BASE_URL, LLM_MODEL) in `.streamlit/secrets.toml`.")
+        st.warning("No LLM API key configured. Add LLM_API_KEY in `.streamlit/secrets.toml`.")
         return None
+
+    url = (LLM_BASE_URL.rstrip("/") + "/chat/completions") if LLM_BASE_URL else "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {LLM_API_KEY}",
+        # OpenRouter recommends these for routing/limits transparency
+        "HTTP-Referer": APP_URL,
+        "X-Title": APP_TITLE,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": LLM_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+    }
+    try:
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        if r.status_code != 200:
+            st.error(f"LLM call failed [{r.status_code}]: {r.text}")
+            return None
+        data = r.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", None)
+    except Exception as e:
+        st.error(f"LLM network error: {e}")
+        return None
+
+def call_llm(system_prompt: str, user_prompt: str):
+    """
+    OpenRouter: use requests with required headers.
+    Other providers: use OpenAI SDK with base_url (OpenAI-compatible gateways).
+    """
+    if LLM_PROVIDER.lower() == "openrouter":
+        with st.spinner("Generating with OpenRouter…"):
+            return _call_openrouter_chat(system_prompt, user_prompt)
+
+    if not LLM_API_KEY:
+        st.warning("No LLM API key configured. Add LLM_API_KEY in `.streamlit/secrets.toml`.")
+        return None
+
     try:
         from openai import OpenAI
     except Exception:
@@ -65,17 +110,17 @@ def call_llm(system_prompt: str, user_prompt: str):
         return None
 
     try:
-        # For OpenRouter, OpenAI, Together (via compatible base_url)
-        client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
-        resp = client.chat.completions.create(
-            model=LLM_MODEL,
-            temperature=0.2,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        return resp.choices[0].message.content
+        with st.spinner("Generating recommendations…"):
+            client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
+            resp = client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            return resp.choices[0].message.content
     except Exception as e:
         st.error(f"LLM call failed: {e}")
         return None
@@ -335,7 +380,7 @@ Task:
                 if text:
                     st.markdown(text)
                 else:
-                    st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
+                    st.error("LLM did not return text. Check API key/credits, headers, and model name in `.streamlit/secrets.toml`.")
 
 # ---- Metrics ----------------------------------------------------------------
 with tab_metrics:
