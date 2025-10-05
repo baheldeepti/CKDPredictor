@@ -16,3 +16,4 @@ llvmlite==0.42.0
 crewai
 langgraph
 openai
+requests>=2.31.0
