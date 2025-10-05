@@ -1,63 +1,67 @@
 # api/agents.py
 """
-LLM agent utilities for NephroCompass.
+LLM agent utilities for NephroCompass / CKD Predictor.
 
-- Uses OpenRouter via the OpenAI SDK-compatible client.
-- Default model: meta-llama/llama-3.1-8b-instruct
-- Exposes:
+- Uses an OpenAI-compatible client (OpenRouter, Together, OpenAI, etc.) via either:
+    * the OpenAI Python SDK (preferred when installed), or
+    * a raw HTTP fallback.
+
+Exports:
     * multi_agent_plan(summary: dict) -> dict
+        Returns a structured object with 'sections' for easy UI rendering.
     * cohort_insights_card(metrics: dict) -> dict
     * ask_llm(system: str, user: str, temperature: float = 0.2) -> dict
+        => {"ok": bool, "text": str|None, "error": str|None}
 
 Environment variables:
-- LLM_API_KEY     : required for OpenRouter
-- LLM_BASE_URL    : defaults to https://openrouter.ai/api/v1
-- LLM_MODEL       : defaults to meta-llama/llama-3.1-8b-instruct
-- APP_URL         : optional (OpenRouter best-practice header via raw fallback)
-- APP_TITLE       : optional (OpenRouter best-practice header via raw fallback)
+- LLM_API_KEY   : API key for your provider (required for production).
+- LLM_BASE_URL  : default https://openrouter.ai/api/v1 (works for OpenRouter).
+- LLM_MODEL     : default meta-llama/llama-3.1-8b-instruct (set to your provider’s model).
+- APP_URL       : optional; sent as HTTP-Referer for OpenRouter best practices.
+- APP_TITLE     : optional; sent as X-Title for OpenRouter best practices.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import json
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
-# Preferred: OpenAI SDK with custom base_url (works with OpenRouter)
-from openai import OpenAI
+# Try to import the OpenAI SDK; if unavailable, we fall back to raw HTTP.
+try:
+    from openai import OpenAI  # type: ignore
+except Exception:  # pragma: no cover
+    OpenAI = None  # type: ignore
 
-# Optional raw HTTP fallback (used only if SDK path fails)
 import requests
-
 
 # ---------------------------
 # Config
 # ---------------------------
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-LLM_API_KEY  = os.getenv("LLM_API_KEY", "")  # REQUIRED in production
+LLM_API_KEY  = os.getenv("LLM_API_KEY", "")
 LLM_MODEL    = os.getenv("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct")
 
 # Optional OpenRouter branding headers (used by HTTP fallback only)
 APP_URL   = os.getenv("APP_URL", "https://github.com/baheldeepti/CKDPredictor")
 APP_TITLE = os.getenv("APP_TITLE", "NephroCompass")
 
-
 # ---------------------------
 # Internal helpers
 # ---------------------------
-def _client() -> Optional[OpenAI]:
-    """Return an OpenAI client configured for OpenRouter, or None if key is missing."""
-    if not LLM_API_KEY:
+def _client() -> Optional["OpenAI"]:
+    """Return an OpenAI client configured for an OpenAI-compatible base_url, or None."""
+    if not LLM_API_KEY or OpenAI is None:
         return None
     try:
         return OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
     except Exception:
         return None
 
-
 def _http_fallback_chat(system: str, user: str, temperature: float = 0.2) -> Dict[str, Any]:
     """
-    Raw HTTP call to OpenRouter (fallback if SDK path fails).
+    Raw HTTP call to {LLM_BASE_URL}/chat/completions (OpenAI-compatible).
     Returns {"ok": bool, "text": str|None, "error": str|None}
     """
     if not LLM_API_KEY:
@@ -67,13 +71,13 @@ def _http_fallback_chat(system: str, user: str, temperature: float = 0.2) -> Dic
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
         "Content-Type": "application/json",
-        # OpenRouter best practice (optional)
+        # OpenRouter best practice (harmless for other providers)
         "HTTP-Referer": APP_URL,
         "X-Title": APP_TITLE,
     }
     payload = {
         "model": LLM_MODEL,
-        "temperature": temperature,
+        "temperature": float(temperature),
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -91,33 +95,91 @@ def _http_fallback_chat(system: str, user: str, temperature: float = 0.2) -> Dic
     except Exception as e:
         return {"ok": False, "text": None, "error": f"HTTP error: {e}"}
 
-
 def ask_llm(system: str, user: str, temperature: float = 0.2) -> Dict[str, Any]:
     """
-    High-level LLM call. Tries OpenAI SDK first; falls back to raw HTTP.
-    Returns dict: { "ok": bool, "text": str|None, "error": str|None }
+    High-level LLM call. Tries OpenAI SDK first (if installed), then raw HTTP.
+    Returns: { "ok": bool, "text": str|None, "error": str|None }
     """
     client = _client()
-    if client:
+    if client is not None:
         try:
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
-                temperature=temperature,
+                temperature=float(temperature),
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
             )
-            text = resp.choices[0].message.content if resp.choices else None
+            text = resp.choices[0].message.content if getattr(resp, "choices", None) else None
             if not text:
                 return {"ok": False, "text": None, "error": "Empty completion."}
             return {"ok": True, "text": text, "error": None}
-        except Exception as e:
-            # fall back to HTTP call
-            return _http_fallback_chat(system, user, temperature)
-    else:
-        return _http_fallback_chat(system, user, temperature)
+        except Exception:
+            # Silent fall-through to HTTP fallback; provider differences are common
+            pass
+    return _http_fallback_chat(system, user, temperature)
 
+# ---------------------------
+# Parsing helpers for structured UI output
+# ---------------------------
+_SECTION_TITLES = [
+    "Clinical Interpretation",
+    "Diet & Lifestyle",
+    "Follow-up & Referrals",
+    "Patient Communication (Plain Language)",
+]
+
+def _split_to_sections(md_text: str) -> List[Dict[str, Any]]:
+    """
+    Parse a simple markdown plan into sections the UI can render:
+      [{"title":..., "bullets":[...]}]
+    We look for H3 headings matching the expected titles; otherwise we create a
+    single section with the whole text.
+    """
+    if not md_text or not isinstance(md_text, str):
+        return []
+
+    # Normalize line endings
+    text = md_text.replace("\r\n", "\n").strip()
+
+    # Try to split on ### headers first
+    parts = re.split(r"\n\s*###\s+", "\n### " + text)  # ensure it starts with a header for uniformity
+    sections = []
+    for chunk in parts:
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        # Title = first line up to newline
+        first_nl = chunk.find("\n")
+        if first_nl == -1:
+            title = chunk.strip("# ").strip()
+            body = ""
+        else:
+            title = chunk[:first_nl].strip("# ").strip()
+            body = chunk[first_nl + 1 :].strip()
+
+        # Collect bullets: lines that start with "-" or "•"
+        bullets = []
+        for line in body.splitlines():
+            l = line.strip()
+            if l.startswith("- "):
+                bullets.append(l[2:].strip())
+            elif l.startswith("• "):
+                bullets.append(l[2:].strip())
+        # Fallback: if no bullets, keep body as text
+        sec: Dict[str, Any] = {"title": title}
+        if bullets:
+            sec["bullets"] = bullets
+        elif body:
+            sec["text"] = body
+        sections.append(sec)
+
+    if sections:
+        return sections
+
+    # Fallback: one big section
+    return [{"title": "Care Plan", "text": text}]
 
 # ---------------------------
 # Public: Multi-agent care plan
@@ -136,18 +198,10 @@ def multi_agent_plan(summary: dict) -> dict:
     """
     Create a structured care plan from model outputs + flags/stage summary.
 
-    Input example:
-    {
-      "label": "CKD",
-      "prob_ckd": 0.81,
-      "stage": 3,
-      "albuminuria": 2,
-      "flags": {"bp_risk":1, "hyperkalemia":0, "anemia":1},
-      "notes": "Any short free text…"
-    }
-
-    Return:
-    { "plan": "<markdown text>" } or { "error": "<msg>" }
+    Return format (preferred by UI):
+      { "sections": [ { "title": "...", "bullets": ["..."] }, ... ] }
+    On failure:
+      { "error": "<message>" }
     """
     user = (
         "Create a care plan for the following case summary (JSON):\n"
@@ -167,8 +221,12 @@ def multi_agent_plan(summary: dict) -> dict:
     res = ask_llm(_MULTI_AGENT_SYSTEM, user, temperature=0.2)
     if not res["ok"]:
         return {"error": res["error"]}
-    return {"plan": res["text"]}
 
+    sections = _split_to_sections(res["text"])
+    if not sections:
+        # Keep a plain fallback to display *something* in the UI
+        return {"plan": res["text"]}
+    return {"sections": sections}
 
 # ---------------------------
 # Public: Cohort insights card
@@ -181,16 +239,7 @@ _COHORT_SYSTEM = (
 def cohort_insights_card(metrics: dict) -> dict:
     """
     Produce a compact, sectioned cohort summary suitable for a UI card.
-    Input example:
-      {
-        "model": "XGBoost",
-        "positive_rate": 0.24,
-        "avg_prob_ckd": 0.41,
-        "rows": 512
-      }
-
-    Returns:
-      { "summary": "<markdown text>" } or { "error": "<msg>" }
+    Returns either {"summary": "...markdown..."} or {"error": "..."}.
     """
     user = (
         "Summarize the cohort using these metrics (JSON):\n"
@@ -208,7 +257,6 @@ def cohort_insights_card(metrics: dict) -> dict:
     if not res["ok"]:
         return {"error": res["error"]}
     return {"summary": res["text"]}
-
 
 # ---------------------------
 # Module exports
