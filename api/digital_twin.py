@@ -8,10 +8,11 @@ from typing import Dict, List, Tuple, Any, Optional, Iterable
 import numpy as np
 import pandas as pd
 from joblib import load
+from pydantic import BaseModel, Field
 
-# --------------------------------------------------------------------------------------
-# Local registry & feature schema (avoids circular import with api.app)
-# --------------------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Local registry & schema (avoid importing api.app to prevent circular import)
+# ---------------------------------------------------------------------------
 ROOT_DIR = Path(__file__).resolve().parents[1]     # repo root
 MODEL_DIR = Path(os.getenv("MODEL_DIR") or (ROOT_DIR / "models"))
 
@@ -19,7 +20,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     "xgb": {
         "model": MODEL_DIR / "xgb_ckd.joblib",
         "thr":   MODEL_DIR / "xgb_ckd_threshold.json",
-        "flip_probas": False,   # set True only if your old xgb has flipped outputs
+        "flip_probas": False,   # set True only if your old xgb had flipped outputs
     },
     "rf": {
         "model": MODEL_DIR / "rf_ckd.joblib",
@@ -45,17 +46,14 @@ FEATURE_COLS: List[str] = [
     "bp_risk", "hyperkalemiaflag", "anemiaflag",
 ]
 
-# --------------------------------------------------------------------------------------
-# Helpers (standalone)
-# --------------------------------------------------------------------------------------
-def _load_artifacts(model_key: str):
-    mk = str(model_key).lower()
+def _load_artifacts(model_key: str) -> Tuple[Any, float, bool]:
+    mk = model_key.lower()
     if mk not in REGISTRY:
         raise ValueError(f"Unknown model '{model_key}'. Use one of {list(REGISTRY)}")
     p = REGISTRY[mk]
     if not p["model"].exists():
         raise FileNotFoundError(f"Model file missing for '{mk}': {p['model']}")
-    model = load(p["model"])
+    mdl = load(p["model"])
     thr = 0.5
     if p["thr"].exists():
         try:
@@ -64,7 +62,7 @@ def _load_artifacts(model_key: str):
         except Exception:
             pass
     flip = bool(p.get("flip_probas", False))
-    return model, float(thr), flip
+    return mdl, float(thr), flip
 
 def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
     for c in FEATURE_COLS:
@@ -72,73 +70,83 @@ def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
             raise ValueError(f"Missing feature: {c}")
     return df[FEATURE_COLS].copy()
 
-def _rederive_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Keep derived values consistent when inputs change.
-    Requires that the base record already contained all FEATURE_COLS once.
-    """
-    out = dict(row)
+# ---------------------------------------------------------------------------
+# Derived fields & flags (kept consistent with other modules)
+# ---------------------------------------------------------------------------
+def _derive_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    # coerce numerics where needed
+    def f(x: Any, default: float = 0.0) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
+    sysbp = f(row.get("systolicbp"))
+    diabp = f(row.get("diastolicbp"))
+    bun   = f(row.get("bunlevels"))
+    crea  = f(row.get("serumcreatinine"))
+    gfr   = f(row.get("gfr"))
+    acr   = f(row.get("acr"))
+    na    = f(row.get("serumelectrolytessodium"))
+    k     = f(row.get("serumelectrolytespotassium"))
+    hb    = f(row.get("hemoglobinlevels"))
+
     # Derived
-    if "systolicbp" in out and "diastolicbp" in out:
-        out["pulsepressure"] = float(out["systolicbp"]) - float(out["diastolicbp"])
-    if "bunlevels" in out and "serumcreatinine" in out:
-        out["ureacreatinineratio"] = float(out["bunlevels"]) / (float(out["serumcreatinine"]) + 1e-6)
+    row["pulsepressure"] = sysbp - diabp
+    row["ureacreatinineratio"] = bun / (crea + 1e-6)
 
-    # If stage/alb/flags were present, keep them plausible with simple rules
-    try:
-        gfr = float(out.get("gfr", 0.0))
-        if gfr >= 90: stage = 1
-        elif gfr >= 60: stage = 2
-        elif gfr >= 45: stage = 3
-        elif gfr >= 30: stage = 3
-        elif gfr >= 15: stage = 4
-        else: stage = 5
-        out["ckdstage"] = int(stage)
-    except Exception:
-        pass
+    # Stage (coarse)
+    if gfr >= 90: stage = 1
+    elif gfr >= 60: stage = 2
+    elif gfr >= 45: stage = 3
+    elif gfr >= 30: stage = 3
+    elif gfr >= 15: stage = 4
+    else: stage = 5
+    row["ckdstage"] = int(stage)
 
-    try:
-        acr = float(out.get("acr", 0.0))
-        if acr < 30: alb = 1
-        elif acr <= 300: alb = 2
-        else: alb = 3
-        out["albuminuriacat"] = int(alb)
-    except Exception:
-        pass
+    # Albuminuria category
+    if acr < 30: alb = 1
+    elif acr <= 300: alb = 2
+    else: alb = 3
+    row["albuminuriacat"] = int(alb)
 
-    try:
-        sbp = float(out.get("systolicbp", 0.0))
-        dbp = float(out.get("diastolicbp", 0.0))
-        k   = float(out.get("serumelectrolytespotassium", 0.0))
-        hb  = float(out.get("hemoglobinlevels", 0.0))
-        out["bp_risk"] = 1 if (sbp >= 130 or dbp >= 80) else 0
-        out["hyperkalemiaflag"] = 1 if k >= 5.5 else 0
-        out["anemiaflag"] = 1 if hb < 12.0 else 0
-    except Exception:
-        pass
+    # Flags
+    row["bp_risk"] = 1 if (sysbp >= 130 or diabp >= 80) else 0
+    row["hyperkalemiaflag"] = 1 if k >= 5.5 else 0
+    row["anemiaflag"] = 1 if hb < 12.0 else 0
 
-    return out
+    # Keep plausible ranges on electrolytes
+    row["serumelectrolytessodium"] = float(np.clip(na, 110.0, 170.0))
+    row["serumelectrolytespotassium"] = float(np.clip(k, 2.0, 7.5))
+    return row
 
-def _simulate_once(base: Dict[str, float], deltas: Dict[str, float]) -> Dict[str, float]:
-    out = {k: float(v) if isinstance(v, (int, float, np.integer, np.floating)) else v for k, v in base.items()}
+# ---------------------------------------------------------------------------
+# Pydantic request (mirrors app schema but local to avoid circular import)
+# ---------------------------------------------------------------------------
+class WhatIfRequest(BaseModel):
+    base: Dict[str, float] = Field(..., description="Baseline PatientFeatures dict")
+    deltas: Optional[Dict[str, float]] = Field(default=None, description="Feature -> additive delta")
+    model: str = "xgb"
+    grid: Optional[Dict[str, List[float]]] = Field(default=None, description="Optional grid sweep")
+
+# ---------------------------------------------------------------------------
+# Core helpers
+# ---------------------------------------------------------------------------
+def _simulate_once(base: Dict[str, float], deltas: Optional[Dict[str, float]]) -> Dict[str, float]:
+    out: Dict[str, Any] = dict(base)
     for k, dv in (deltas or {}).items():
         if k in out:
             out[k] = float(out[k]) + float(dv)
-    out = _rederive_fields(out)
+    # re-derive for consistency
+    out = _derive_fields(out)
     return out
 
-def _predict_proba_dict(row: Dict[str, float], model_key: str) -> Tuple[float, float]:
-    df = pd.DataFrame([row])
-    df = _validate_and_order(df)
+def _predict_probs(row: Dict[str, Any], model_key: str) -> Tuple[float, float]:
     mdl, _, flip = _load_artifacts(model_key)
-    p1 = mdl.predict_proba(df)[:, 1]  # model's positive-class prob
-    if flip:
-        # legacy flip: [:,1] == P(non-CKD)
-        prob_non_ckd = float(p1[0])
-        prob_ckd = 1.0 - prob_non_ckd
-    else:
-        prob_ckd = float(p1[0])
-    return prob_ckd, 1.0 - prob_ckd
+    df = _validate_and_order(pd.DataFrame([row]))
+    p1 = mdl.predict_proba(df)[:, 1]  # standard P(class=1)
+    prob_ckd = float(1.0 - p1[0]) if flip else float(p1[0])
+    return prob_ckd, float(1.0 - prob_ckd)
 
 def _cartesian(arrays: List[List[float]]) -> Iterable[List[float]]:
     if not arrays:
@@ -149,34 +157,52 @@ def _cartesian(arrays: List[List[float]]) -> Iterable[List[float]]:
         for rest in _cartesian(tail):
             yield [h] + rest
 
-# --------------------------------------------------------------------------------------
-# Public entry (called from FastAPI layer). Accepts pydantic model or dict-like.
-# --------------------------------------------------------------------------------------
-def simulate_whatif(req) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Public API for FastAPI layer
+# ---------------------------------------------------------------------------
+def simulate_whatif(req: WhatIfRequest | Dict[str, Any]) -> Dict[str, Any]:
     """
-    Accepts either:
-      - a Pydantic WhatIfRequest-like object (with .base, .deltas, .model, .grid)
-      - a plain dict with the same keys.
-
-    Returns:
-      Single-run:
-        { "mode": "single", "rows": [row], "probs": [{"prob_ckd": x, "prob_non_ckd": y}] }
-      Grid:
-        { "mode": "grid", "features": [...], "rows": [...], "probs": [{"prob_ckd":...}, ...] }
+    Run a single what-if (base + deltas) OR a grid sweep if req.grid is provided.
+    Accepts either a Pydantic WhatIfRequest or a raw dict with matching keys.
     """
-    # Tolerate both Pydantic and dict inputs
-    payload: Dict[str, Any]
-    if hasattr(req, "dict"):
-        payload = req.dict()
-    else:
-        payload = dict(req)
-
+    payload: Dict[str, Any] = req if isinstance(req, dict) else req.dict()
     base: Dict[str, float] = payload.get("base", {}) or {}
-    deltas: Dict[str, float] = payload.get("deltas", {}) or {}
+    deltas: Optional[Dict[str, float]] = payload.get("deltas") or None
     model_key: str = str(payload.get("model", "xgb")).lower()
-    grid: Optional[Dict[str, List[float]]] = payload.get("grid")
+    grid: Optional[Dict[str, List[float]]] = payload.get("grid") or None
 
-    # Single-shot case
+    # Ensure base has required keys — this function doesn’t invent missing features
+    missing = [c for c in FEATURE_COLS if c not in base]
+    if missing:
+        raise ValueError(f"Missing features in base: {missing}")
+
     if not grid:
         row = _simulate_once(base, deltas)
-        p_ckd, p_non = _predict_proba_dict(row
+        p_ckd, p_non = _predict_probs(row, model_key)
+        return {
+            "mode": "single",
+            "rows": [row],
+            "probs": [{"prob_ckd": p_ckd, "prob_non_ckd": p_non}],
+            "model": model_key,
+        }
+
+    feats = list(grid.keys())
+    grids = [grid[f] for f in feats]
+    rows: List[Dict[str, float]] = []
+    probs: List[Dict[str, float]] = []
+
+    for values in _cartesian(grids):
+        # interpret grid value as ABSOLUTE target for the feature, adjust delta accordingly
+        deltas_abs = {f: (float(v) - float(base.get(f, 0.0))) for f, v in zip(feats, values)}
+        row = _simulate_once(base, deltas_abs)
+        p_ckd, p_non = _predict_probs(row, model_key)
+        rows.append(row)
+        probs.append({"prob_ckd": p_ckd, "prob_non_ckd": p_non})
+
+    return {
+        "mode": "grid",
+        "features": feats,
+        "rows": rows,
+        "probs": probs,
+        "model": model_key,
+    }
