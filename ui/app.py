@@ -35,7 +35,7 @@ MODEL_CHOICES = [
 MODEL_LABELS = {label: key for (label, key) in MODEL_CHOICES}
 MODEL_KEYS   = {key: label for (label, key) in MODEL_CHOICES}
 
-# Optional LLM config (OpenAI-compatible)
+# Optional LLM config (OpenAI-compatible) — used only in the “AI summary & next steps” tab
 LLM_PROVIDER = st.secrets.get("LLM_PROVIDER", "openrouter")  # openai | together | openrouter | custom
 LLM_API_KEY  = st.secrets.get("LLM_API_KEY", "")
 LLM_BASE_URL = st.secrets.get("LLM_BASE_URL", "https://openrouter.ai/api/v1")
@@ -56,7 +56,7 @@ STYLE = """
   --brand:#2563eb; --ok:#16a34a; --warn:#f59e0b; --bad:#ef4444; --muted:#6b7280; --bg:#f8fafc;
 }
 html, body, [class^="css"]  {
-  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
 }
 section.main > div { padding-top: 0.5rem !important; }
 h1, h2, h3 { letter-spacing: -0.01em; }
@@ -64,8 +64,7 @@ h1, h2, h3 { letter-spacing: -0.01em; }
 .badge { padding:2px 10px; border-radius:999px; font-weight:600; display:inline-block; }
 .card  { padding:14px; border-radius:12px; border:1px solid #e6e6e6; background:#fff; }
 hr     { border: none; border-top:1px solid #eee; margin: 0.5rem 0 1rem; }
-.stButton>button { border-radius:10px; border:1px solid rgba(0,0,0,0.08); }
-.stDownloadButton>button { border-radius:10px; }
+.stButton>button, .stDownloadButton>button { border-radius:10px; border:1px solid rgba(0,0,0,0.08); }
 .block-info { font-size:13px; color:#334155; }
 .top-chip { font-size:12px; color:var(--muted); margin-top:-6px; }
 .tooltip { font-size:12px; color:#475569; }
@@ -99,7 +98,6 @@ def sanitize_payload(d: dict) -> dict:
     return out
 
 def _risk_badge(prob_ckd: float, thr: float) -> tuple[str, str, str]:
-    # label, bg, color
     if prob_ckd >= thr:
         return "Above threshold", "#fee2e2", "#991b1b"
     if prob_ckd >= 0.33:
@@ -336,11 +334,26 @@ st.divider()
 # =========================
 # Tabs
 # =========================
-tab_single, tab_batch, tab_metrics, tab_advice = st.tabs(
-    ["Single check (compare models)",
-     "Bulk check (CSV)",
-     "Service & logs",
-     "AI summary & next steps"]
+(
+    tab_single,
+    tab_batch,
+    tab_metrics,
+    tab_advice,
+    tab_digital_twin,
+    tab_counterfactuals,
+    tab_similarity,
+    tab_agents
+) = st.tabs(
+    [
+        "Single check (compare models)",
+        "Bulk check (CSV)",
+        "Service & logs",
+        "AI summary & next steps",
+        "Digital Twin (What-If)",
+        "Counterfactuals",
+        "Similar Patients",
+        "Care Plan (Agents)"
+    ]
 )
 
 # =========================
@@ -469,7 +482,7 @@ with tab_single:
             with ecols[idx]:
                 with st.spinner(f"{MODEL_KEYS.get(m,m)} — computing SHAP"):
                     try:
-                        er = requests.post(f"{st.session_state['api_url']}/explain", params={"model": m}, json=payload, timeout=60)
+                        er = requests.post(f"{st.session_state['api_url']}/explain", params={"model": m}, json=st.session_state["last_pred_payload"], timeout=60)
                         if er.status_code == 404:
                             st.info("API has no /explain endpoint.")
                             _log(f"Explain skipped ({m}): 404")
@@ -508,7 +521,7 @@ with tab_single:
                         _log(f"Explain ERROR ({m}): {e}")
 
 # =========================
-# Batch predictions
+# Bulk predictions
 # =========================
 with tab_batch:
     st.markdown("Upload a CSV, run through selected models, and compare results.")
@@ -617,7 +630,7 @@ with tab_batch:
         except Exception as e:
             st.error(f"Failed to read CSV: {e}")
 
-    # Cohort insights (AI)
+    # Cohort insights (AI) – frontend LLM helper (unchanged)
     st.markdown("#### AI cohort summary")
     st.caption("Turns batch results into a short clinical overview. No medication dosing.")
     available_models = list(st.session_state.get("batch_preds", {}).keys())
@@ -736,7 +749,7 @@ with tab_metrics:
         st.error(f"Report fetch failed: {e}")
 
 # =========================
-# AI summary & next steps
+# AI summary & next steps (frontend LLM)
 # =========================
 with tab_advice:
     st.markdown(
@@ -814,3 +827,243 @@ Constraints:
             else:
                 st.error("LLM did not return text. Check API key/credits and model name in `.streamlit/secrets.toml`.")
                 _log("Recommendations FAILED.")
+
+# =========================
+# Digital Twin (What-If) — uses /whatif
+# =========================
+with tab_digital_twin:
+    st.markdown("Run **what-if** scenarios on the last single case or custom values. Either apply small deltas or a grid sweep.")
+    base = st.session_state.get("last_pred_payload") or {}
+    if not base:
+        st.info("Run a single prediction first to set a baseline, or paste JSON below.")
+    base_json = st.text_area("Baseline JSON (optional, overrides last single payload if provided)", value=json.dumps(base, indent=2))
+    use_base = {}
+    try:
+        if base_json.strip():
+            use_base = sanitize_payload(json.loads(base_json))
+    except Exception as e:
+        st.error(f"Baseline JSON parse error: {e}")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Simple deltas** (applied to baseline)")
+        d_sbp = st.number_input("Δ Systolic BP (mmHg)", -40, 40, 0)
+        d_dbp = st.number_input("Δ Diastolic BP (mmHg)", -30, 30, 0)
+        d_gfr = st.number_input("Δ GFR (mL/min/1.73m²)", -50, 50, 0)
+        d_acr = st.number_input("Δ ACR (mg/g)", -500, 500, 0)
+        d_k   = st.number_input("Δ Potassium (mEq/L)", -2.0, 2.0, 0.0, step=0.1)
+        d_a1c = st.number_input("Δ HbA1c (%)", -3.0, 3.0, 0.0, step=0.1)
+        deltas = {
+            "systolicbp": d_sbp,
+            "diastolicbp": d_dbp,
+            "gfr": d_gfr,
+            "acr": d_acr,
+            "serumelectrolytespotassium": d_k,
+            "hba1c": d_a1c,
+        }
+    with c2:
+        st.markdown("**Grid sweep** (comma-separated values)")
+        grid_sbp = st.text_input("SBP list", "120,130,140")
+        grid_gfr = st.text_input("GFR list", "30,45,60,75,90")
+        grid_acr = st.text_input("ACR list", "10,30,300")
+        grid = {}
+        try:
+            if grid_sbp.strip():
+                grid["systolicbp"] = [float(x) for x in grid_sbp.split(",") if x.strip()]
+            if grid_gfr.strip():
+                grid["gfr"] = [float(x) for x in grid_gfr.split(",") if x.strip()]
+            if grid_acr.strip():
+                grid["acr"] = [float(x) for x in grid_acr.split(",") if x.strip()]
+        except Exception as e:
+            st.error(f"Grid parse error: {e}")
+
+    model_for_sim = st.selectbox("Model for simulation", [MODEL_KEYS.get(m,m) for m in MODEL_KEYS], index=1)
+    model_key_sim = MODEL_LABELS.get(model_for_sim, "rf")
+
+    cA, cB = st.columns(2)
+    with cA:
+        if st.button("Run single what-if"):
+            body = {"base": use_base or base, "deltas": deltas, "model": model_key_sim}
+            try:
+                r = requests.post(f"{st.session_state['api_url']}/whatif", json=body, timeout=60)
+                r.raise_for_status()
+                out = r.json()
+                st.success("Done.")
+                st.json(out)
+            except requests.HTTPError as e:
+                st.error("What-if failed")
+                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+            except Exception as e:
+                st.error(f"What-if error: {e}")
+    with cB:
+        if st.button("Run grid sweep"):
+            body = {"base": use_base or base, "grid": grid, "model": model_key_sim}
+            try:
+                r = requests.post(f"{st.session_state['api_url']}/whatif", json=body, timeout=120)
+                r.raise_for_status()
+                out = r.json()
+                st.success("Done.")
+                if isinstance(out, dict) and "rows" in out:
+                    st.dataframe(pd.DataFrame(out["rows"]))
+                else:
+                    st.json(out)
+            except requests.HTTPError as e:
+                st.error("Grid what-if failed")
+                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+            except Exception as e:
+                st.error(f"Grid what-if error: {e}")
+
+# =========================
+# Counterfactuals — uses /counterfactual
+# =========================
+with tab_counterfactuals:
+    st.markdown("Find **actionable changes** to reduce risk below a target using greedy search or DiCE (if backend enabled).")
+    base = st.session_state.get("last_pred_payload") or {}
+    if not base:
+        st.info("Run a single prediction first to set a baseline, or paste JSON below.")
+    base_json = st.text_area("Baseline JSON (optional, overrides last single payload if provided)", value=json.dumps(base, indent=2))
+    use_base = {}
+    try:
+        if base_json.strip():
+            use_base = sanitize_payload(json.loads(base_json))
+    except Exception as e:
+        st.error(f"Baseline JSON parse error: {e}")
+
+    col1, col2, col3 = st.columns([1,1,1])
+    with col1:
+        target_prob = st.number_input("Target prob (≤ this)", 0.0, 1.0, 0.2, step=0.01)
+    with col2:
+        method = st.selectbox("Method", ["auto", "greedy"], index=0)
+    with col3:
+        model_for_cf = st.selectbox("Model", [MODEL_KEYS.get(m,m) for m in MODEL_KEYS], index=1)
+    model_key_cf = MODEL_LABELS.get(model_for_cf, "rf")
+
+    if st.button("Compute counterfactual"):
+        body = {"base": use_base or base, "target_prob": target_prob, "model": model_key_cf, "method": method}
+        try:
+            r = requests.post(f"{st.session_state['api_url']}/counterfactual", json=body, timeout=120)
+            r.raise_for_status()
+            out = r.json()
+            st.success("Counterfactual ready.")
+            if isinstance(out, dict) and "steps" in out:
+                st.markdown("**Search path**")
+                st.table(pd.DataFrame(out["steps"]))
+            st.markdown("**Final candidate**")
+            res = out.get("result") or out.get("best", {}).get("candidate")
+            if res:
+                st.json(res)
+            else:
+                st.json(out)
+        except requests.HTTPError as e:
+            st.error("Counterfactual failed")
+            st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+        except Exception as e:
+            st.error(f"Counterfactual error: {e}")
+
+# =========================
+# Similar Patients — uses /similar
+# =========================
+with tab_similarity:
+    st.markdown("Find **nearest neighbors** in an uploaded cohort to compare similar profiles.")
+    base = st.session_state.get("last_pred_payload") or {}
+    if not base:
+        st.info("Run a single prediction first to set a baseline, or paste JSON below.")
+    base_json = st.text_area("Baseline JSON (optional, overrides last single payload if provided)", value=json.dumps(base, indent=2))
+    use_base = {}
+    try:
+        if base_json.strip():
+            use_base = sanitize_payload(json.loads(base_json))
+    except Exception as e:
+        st.error(f"Baseline JSON parse error: {e}")
+
+    cohort_file = st.file_uploader("Upload cohort CSV to search in", type=["csv"])
+    k = st.slider("Top-k similar", 1, 50, 5)
+
+    if st.button("Find similar"):
+        try:
+            cohort = []
+            if cohort_file:
+                dfc = pd.read_csv(cohort_file)
+                # keep only expected columns; fill missing
+                for c in FEATURE_COLUMNS:
+                    if c not in dfc.columns:
+                        dfc[c] = 0.0
+                dfc = dfc[FEATURE_COLUMNS]
+                cohort = [sanitize_payload(r) for r in dfc.to_dict(orient="records")]
+            body = {"base": use_base or base, "cohort": cohort}
+            # POST with Body(...): FastAPI expects JSON body; include k in query
+            r = requests.post(f"{st.session_state['api_url']}/similar?k={k}", json=body, timeout=60)
+            r.raise_for_status()
+            out = r.json()
+            st.success("Similar patients computed.")
+            if isinstance(out, dict) and "neighbors" in out:
+                st.table(pd.DataFrame(out["neighbors"]))
+            else:
+                st.json(out)
+        except requests.HTTPError as e:
+            st.error("Similarity failed")
+            st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+        except Exception as e:
+            st.error(f"Similarity error: {e}")
+
+# =========================
+# Care Plan (Agents) — uses /agents/plan
+# =========================
+with tab_agents:
+    st.markdown("LLM multi-agent **care plan** generated on the server (via `/agents/plan`).")
+    payload = st.session_state.get("last_pred_payload")
+    results = st.session_state.get("last_pred_results", {})
+
+    if not payload or not results:
+        st.info("Run a single prediction first so we can build the summary for agents.")
+    else:
+        avail = list(results.keys())
+        chosen = st.selectbox("Use result from model", [MODEL_KEYS.get(m, m) for m in avail], index=0)
+        chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
+        res = results[chosen_key]
+
+        # Build summary for API agents — keep it compact
+        summary = {
+            "model": chosen_key,
+            "prob_ckd": float(res.get("prob_ckd", 0.0)),
+            "threshold": float(res.get("threshold_used", 0.5)),
+            "flags": {
+                "bp_risk": int(payload.get("bp_risk", 0)),
+                "hyperkalemia": int(payload.get("hyperkalemiaflag", 0)),
+                "anemia": int(payload.get("anemiaflag", 0)),
+            },
+            "stage": int(payload.get("ckdstage", 0)),
+            "albuminuria_cat": int(payload.get("albuminuriacat", 0)),
+            "metrics": {
+                "gfr": float(payload.get("gfr", 0)),
+                "acr": float(payload.get("acr", 0)),
+                "hba1c": float(payload.get("hba1c", 0)),
+                "systolicbp": float(payload.get("systolicbp", 0)),
+                "diastolicbp": float(payload.get("diastolicbp", 0)),
+                "potassium": float(payload.get("serumelectrolytespotassium", 0)),
+                "hb": float(payload.get("hemoglobinlevels", 0)),
+            }
+        }
+
+        if st.button("Generate care plan (server agents)"):
+            try:
+                r = requests.post(f"{st.session_state['api_url']}/agents/plan", json=summary, timeout=120)
+                r.raise_for_status()
+                out = r.json()
+                st.success("Care plan generated.")
+                # Try to render common structure: {sections: [{title, bullets/text}...]}
+                if isinstance(out, dict) and out.get("sections"):
+                    for sec in out["sections"]:
+                        st.markdown(f"**{sec.get('title','Section')}**")
+                        if "bullets" in sec and isinstance(sec["bullets"], list):
+                            st.markdown("\n".join([f"- {b}" for b in sec["bullets"]]))
+                        elif "text" in sec:
+                            st.markdown(nl2br(str(sec["text"])), unsafe_allow_html=True)
+                        st.markdown("---")
+                else:
+                    st.json(out)
+            except requests.HTTPError as e:
+                st.error("Agents plan failed")
+                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+            except Exception as e:
+                st.error(f"Agents error: {e}")
