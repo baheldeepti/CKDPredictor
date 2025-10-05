@@ -17,16 +17,17 @@ from sqlalchemy import create_engine, text
 # Configuration
 # -----------------------------------------------------------------------------
 
-# IMPORTANT: Earlier you trained XGB with flipped labels (proba[:,1] ~ P(non-CKD)).
-# After adopting ml/99_retrain.py, XGB is trained with standard mapping (proba[:,1] ~ P(CKD)).
-# Set this to True if you’re still using the *legacy* XGB model; set to False after retraining.
+# IMPORTANT:
+# If you're still serving the *older* XGBoost model you trained before the unified retrain script,
+# set this True (because that model's proba[:,1] was P(non-CKD)).
+# After switching to models produced by ml/99_retrain.py, set this to False (standard proba[:,1] = P(CKD)).
 LEGACY_XGB_FLIPPED = True
 
 REGISTRY: Dict[str, Dict[str, object]] = {
     "xgb": {
         "model": Path("models/xgb_ckd.joblib"),
         "thr":   Path("models/xgb_ckd_threshold.json"),
-        "flip_probas": LEGACY_XGB_FLIPPED,  # compatibility switch
+        "flip_probas": LEGACY_XGB_FLIPPED,  # compatibility switch for XGB only
     },
     "rf": {
         "model": Path("models/rf_ckd.joblib"),
@@ -88,7 +89,7 @@ class BatchPredictResponse(BaseModel):
 # App + Model cache
 # -----------------------------------------------------------------------------
 
-app = FastAPI(title="CKD Predictor API", version="0.3.0")
+app = FastAPI(title="CKD Predictor API", version="0.3.1")
 _cache: Dict[str, Dict[str, object]] = {}  # {model: {"model": sklearn_obj, "thr": float, "flip": bool}}
 
 def get_model_and_thr(model_key: str):
@@ -108,6 +109,7 @@ def get_model_and_thr(model_key: str):
     return _cache[model_key]["model"], _cache[model_key]["thr"], _cache[model_key]["flip"]
 
 def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
+    # validate columns & order
     for c in FEATURE_COLS:
         if c not in df.columns:
             raise HTTPException(status_code=400, detail=f"Missing feature: {c}")
@@ -115,16 +117,15 @@ def predict_core(df: pd.DataFrame, model_key: str) -> pd.DataFrame:
 
     mdl, thr, flip = get_model_and_thr(model_key)
 
-    # Compute probabilities
-    proba1 = mdl.predict_proba(df)[:, 1]  # usually P(CKD)
+    # Probabilities
+    proba1 = mdl.predict_proba(df)[:, 1]  # standard: P(CKD)
     if flip:
-        # Legacy XGB path: proba1 was P(Non-CKD); flip to get P(CKD)
+        # Legacy XGB path: proba1 is actually P(Non-CKD)
         prob_non_ckd = proba1
         prob_ckd = 1.0 - proba1
-        # Threshold is defined on "probability of class 0 (non-CKD)" in tuning;
-        # our preds are class 0 if prob_non_ckd >= thr.
+        # Threshold tuned on P(non-CKD) -> class 0 if prob_non_ckd >= thr
         pred_class0 = (prob_non_ckd >= thr).astype(int)  # 1 means "Non-CKD"
-        prediction = np.where(pred_class0 == 1, 0, 1)    # convert to original: 0 Non-CKD, 1 CKD
+        prediction = np.where(pred_class0 == 1, 0, 1)    # convert to original labels
     else:
         # Standard path: proba1 is P(CKD)
         prob_ckd = proba1
