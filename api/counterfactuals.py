@@ -26,7 +26,7 @@ REGISTRY: Dict[str, Dict[str, Any]] = {
     "xgb": {
         "model": MODEL_DIR / "xgb_ckd.joblib",
         "thr":   MODEL_DIR / "xgb_ckd_threshold.json",
-        "flip_probas": False,   # set True only if your old xgb has flipped outputs
+        "flip_probas": False,   # set True only if your old xgb had flipped outputs
     },
     "rf": {
         "model": MODEL_DIR / "rf_ckd.joblib",
@@ -122,6 +122,7 @@ def _validate_and_order(df: pd.DataFrame) -> pd.DataFrame:
     return df[FEATURE_COLS].copy()
 
 def _predict_prob_ckd(model, df: pd.DataFrame, flip: bool) -> np.ndarray:
+    """Return P(CKD=1) with optional flip handling."""
     proba1 = model.predict_proba(df)[:, 1]
     if flip:
         return 1.0 - proba1
@@ -225,9 +226,10 @@ def _greedy_counterfactual(
         last_p = prob_of(cur)  # recompute for stored state
         steps.append({
             "feature": best_feat,
-            "delta": best_delta,
+            "delta": float(best_delta),
             "new_value": float(cur[best_feat]),
-            "prob_ckd": last_p,
+            "prob_ckd": float(last_p),
+            "improvement": float(best_change)  # positive means risk went down by this amount
         })
 
         # stopping conditions
@@ -243,7 +245,7 @@ def _greedy_counterfactual(
         "initial_prob": float(p0),
         "final_prob": float(last_p),
         "converged": bool(converged),
-        "iterations": len(steps),
+        "iterations": int(len(steps)),
         "steps": steps,
         "result": {k: (float(v) if isinstance(v, (int, float, np.floating)) else v) for k, v in cur.items()},
     }
@@ -252,12 +254,14 @@ def _greedy_counterfactual(
 # DiCE-ML based counterfactual (optional)
 # ---------------------------------------------------------------------------
 def _dice_counterfactual(
-    model, base: Dict[str, Any], target_prob: float, total_cfs: int = 3
+    model, flip: bool, base: Dict[str, Any], target_prob: float, total_cfs: int = 3
 ) -> Dict[str, Any]:
     """
     Requires:
       - dice-ml installed
       - CF_DICE_DATA_CSV env var pointing to a CSV with FEATURE_COLS
+
+    Uses _predict_prob_ckd(..., flip) so results are consistent with model config.
     """
     if not _DICE_AVAILABLE:
         raise RuntimeError("DiCE not available")
@@ -270,7 +274,7 @@ def _dice_counterfactual(
 
     def score_batch(df_in: pd.DataFrame) -> np.ndarray:
         X = _validate_and_order(df_in.copy())
-        return model.predict_proba(X)[:, 1]
+        return _predict_prob_ckd(model, X, flip)
 
     df = df.copy()
     df["ckd"] = (score_batch(df) >= 0.5).astype(int)  # dummy label for DiCE’s data interface
@@ -280,8 +284,9 @@ def _dice_counterfactual(
     m = dice_ml.Model(model=model, backend="sklearn")
     dice = Dice(d, m, method="random")  # "random" or "kdtree" for continuous features
 
+    # Base (already derived before this function is called)
     query_instance = pd.DataFrame([base])[FEATURE_COLS]
-    current_prob = float(model.predict_proba(query_instance)[:, 1][0])
+    current_prob = float(score_batch(query_instance)[0])
     desired_class = 0 if current_prob > target_prob else 1
 
     cfs = dice.generate_counterfactuals(
@@ -296,7 +301,8 @@ def _dice_counterfactual(
     scored = []
     for r in cfs_list:
         r2 = _derive_fields(r.copy())
-        p = float(model.predict_proba(pd.DataFrame([r2])[FEATURE_COLS])[:, 1][0])
+        X = _validate_and_order(pd.DataFrame([r2]))
+        p = float(_predict_prob_ckd(model, X, flip)[0])
         scored.append({"candidate": r2, "prob_ckd": p})
 
     scored = sorted(scored, key=lambda x: x["prob_ckd"])
@@ -312,6 +318,39 @@ def _dice_counterfactual(
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
+def _normalize_cf_payload(raw: Dict[str, Any], thr: float) -> Dict[str, Any]:
+    """
+    Return a uniform payload for the UI:
+      {
+        method, threshold_used, target_prob, initial_prob, final_prob,
+        final_flag, converged, iterations, steps, final_candidate
+      }
+    """
+    method = str(raw.get("method", "greedy"))
+    initial_prob = float(raw.get("initial_prob", 0.0))
+    final_prob   = float(raw.get("final_prob", initial_prob))
+    target_prob  = float(raw.get("target_prob", 0.2))
+    steps        = raw.get("steps", []) or []
+    converged    = bool(raw.get("converged", final_prob <= target_prob))
+    iterations   = int(raw.get("iterations", len(steps)))
+    # prefer 'result', else best.candidate, else None
+    final_candidate = raw.get("result")
+    if final_candidate is None:
+        final_candidate = raw.get("best", {}).get("candidate")
+
+    return {
+        "method": method,
+        "threshold_used": float(thr),
+        "target_prob": target_prob,
+        "initial_prob": initial_prob,
+        "final_prob": final_prob,
+        "final_flag": bool(final_prob >= float(thr)),
+        "converged": converged,
+        "iterations": iterations,
+        "steps": steps,
+        "final_candidate": final_candidate,
+    }
+
 def counterfactual(req) -> Dict[str, Any]:
     """
     Entry point called by FastAPI layer:
@@ -334,15 +373,18 @@ def counterfactual(req) -> Dict[str, Any]:
     base = _derive_fields({k: base[k] for k in base})
 
     if method == "greedy":
-        return _greedy_counterfactual(model, flip, base, target_prob)
+        raw = _greedy_counterfactual(model, flip, base, target_prob)
+        return _normalize_cf_payload(raw, thr)
 
-    # AUTO: DiCE if available + configured, else greedy
+    # AUTO: DiCE if available + configured, else greedy (all normalized)
     if _DICE_AVAILABLE and os.getenv("CF_DICE_DATA_CSV"):
         try:
-            return _dice_counterfactual(model, base, target_prob, total_cfs=3)
+            raw = _dice_counterfactual(model, flip, base, target_prob, total_cfs=3)
+            return _normalize_cf_payload(raw, thr)
         except Exception as e:
-            greedy = _greedy_counterfactual(model, flip, base, target_prob)
-            greedy["note"] = f"DiCE fallback: {e}"
-            return greedy
-    # Fallback to greedy
-    return _greedy_counterfactual(model, flip, base, target_prob)
+            raw = _greedy_counterfactual(model, flip, base, target_prob)
+            raw["note"] = f"DiCE fallback: {e}"
+            return _normalize_cf_payload(raw, thr)
+
+    raw = _greedy_counterfactual(model, flip, base, target_prob)
+    return _normalize_cf_payload(raw, thr)
