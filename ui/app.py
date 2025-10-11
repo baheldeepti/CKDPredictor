@@ -88,6 +88,14 @@ def nl2br(s: str) -> str:
         return s.replace("\n", "<br/>")
     except Exception:
         return s
+def _cf_feature_nice(f: str) -> str:
+    names = {
+        "systolicbp":"Systolic BP", "diastolicbp":"Diastolic BP", "gfr":"GFR", "acr":"ACR",
+        "serumelectrolytespotassium":"Potassium", "serumelectrolytessodium":"Sodium",
+        "hba1c":"HbA1c", "hemoglobinlevels":"Hemoglobin"
+    }
+    return names.get(f, f)
+
 
 def sanitize_payload(d: dict) -> dict:
     out = {}
@@ -1200,21 +1208,64 @@ with tab_digital_twin:
 # =========================
 # Counterfactuals — uses /counterfactual
 # =========================
+# =========================
+# Counterfactuals — uses /counterfactual
+# =========================
+# =========================
+# Counterfactuals — uses /counterfactual
+# =========================
 with tab_counterfactuals:
-    st.markdown("Find **actionable changes** to reduce risk below a target using greedy search or DiCE (if backend enabled).")
-    base = st.session_state.get("last_pred_payload") or {}
-    if not base:
-        st.info("Run a single prediction first to set a baseline, or paste JSON below.")
-    base_json = st.text_area(
-        "Baseline JSON (optional, overrides last single payload if provided)",
-        value=json.dumps(base, indent=2),
-        key="cf_baseline_json"
-    )
-    use_base = sanitize_payload(safe_json_loads(base_json, fallback=base or {}))
+    st.markdown("### Counterfactuals — Actionable tweaks to get below a target")
+    st.caption("We’ll propose small, realistic changes (BP, A1c, ACR, etc.) that move risk below your chosen target.")
 
+    # --- Baseline: last single OR 1-row CSV OR pasted JSON
+    last_base = st.session_state.get("last_pred_payload") or {}
+    c1, c2 = st.columns([2,1])
+    with c1:
+        if last_base:
+            st.success("Using the last single-check as baseline. You can override below.")
+        else:
+            st.info("No single-check yet. Upload a 1-row CSV or paste JSON below.")
+
+        cf_csv = st.file_uploader("Optional: upload a 1-row CSV baseline", type=["csv"], key="cf_csv")
+        csv_row = None
+        if cf_csv:
+            try:
+                dfx = pd.read_csv(cf_csv)
+                if not dfx.empty:
+                    for c in FEATURE_COLUMNS:
+                        if c not in dfx.columns: dfx[c] = 0.0
+                    csv_row = sanitize_payload(dfx[FEATURE_COLUMNS].iloc[0].to_dict())
+            except Exception as e:
+                st.error(f"CSV read failed: {e}")
+
+        base_json = st.text_area(
+            "Baseline JSON (optional)",
+            value=json.dumps(csv_row or last_base, indent=2) if (csv_row or last_base) else "",
+            placeholder="Paste baseline JSON or leave empty…",
+            key="cf_baseline_json"
+        )
+        use_base = sanitize_payload(safe_json_loads(base_json, fallback=(csv_row or last_base or {})))
+
+    with c2:
+        tmpl = pd.DataFrame(columns=FEATURE_COLUMNS)
+        st.download_button(
+            "Download baseline CSV template",
+            data=tmpl.to_csv(index=False).encode("utf-8"),
+            file_name="ckd_cf_baseline_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="cf_dl_tmpl"
+        )
+
+    if not use_base:
+        st.warning("Provide a baseline using last single, CSV, or JSON above.")
+        st.stop()
+
+    # --- Controls
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
-        target_prob = st.number_input("Target prob (≤ this)", 0.0, 1.0, 0.2, step=0.01, key="cf_target_prob")
+        target_prob = st.number_input("Target probability (≤)", 0.0, 1.0, 0.20, step=0.01, key="cf_target_prob")
     with col2:
         method = st.selectbox("Method", ["auto", "greedy"], index=0, key="cf_method")
     with col3:
@@ -1222,28 +1273,72 @@ with tab_counterfactuals:
     model_key_cf = MODEL_LABELS.get(model_for_cf, "rf")
 
     if st.button("Compute counterfactual", key="btn_cf_compute"):
-        body = {"base": use_base or base, "target_prob": target_prob, "model": model_key_cf, "method": method}
+        body = {"base": use_base, "target_prob": target_prob, "model": model_key_cf, "method": method}
         try:
             out = _api_post(f"{st.session_state['api_url']}/counterfactual", json_body=body, timeout=120)
-            st.success("Counterfactual ready.")
-            if isinstance(out, dict) and "steps" in out:
-                st.markdown("**Search path**")
-                st.table(pd.DataFrame(out["steps"]))
-            st.markdown("**Final candidate**")
-            res = out.get("result") or out.get("best", {}).get("candidate")
-            if res:
-                st.json(res)
+
+            # Expect a normalized shape (see backend patch):
+            # { threshold_used, initial_prob, final_prob, target_prob, final_flag, steps[], final_candidate{} }
+            thr = float(out.get("threshold_used", 0.5))
+            p0  = float(out.get("initial_prob", 0.0))
+            pf  = float(out.get("final_prob", 0.0))
+            flag = bool(out.get("final_flag", pf >= thr))
+
+            # Top card
+            st.markdown(
+                f"""
+                <div class="card">
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <div style="font-weight:700">{MODEL_KEYS.get(model_key_cf, model_key_cf)} plan</div>
+                        <div class="badge" style="background:{'#fee2e2' if flag else '#dcfce7'};color:{'#991b1b' if flag else '#065f46'}">{'Flagged at end' if flag else 'Below threshold'}</div>
+                    </div>
+                    <div style="display:flex;gap:24px;flex-wrap:wrap;">
+                        <div><strong>Start prob</strong><br><span style="font-size:20px;">{p0:.3f}</span></div>
+                        <div><strong>Target prob</strong><br><span style="font-size:20px;">{float(out.get('target_prob', target_prob)):.3f}</span></div>
+                        <div><strong>Final prob</strong><br><span style="font-size:20px;">{pf:.3f}</span></div>
+                        <div><strong>Threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            # Steps table (user-friendly labels + improvements)
+            steps = out.get("steps", []) or []
+            if steps:
+                df_steps = pd.DataFrame(steps)
+                if "feature" in df_steps.columns:
+                    df_steps["feature"] = df_steps["feature"].map(_cf_feature_nice)
+                st.markdown("**Change path**")
+                st.table(df_steps)
+
+                # Summarize total change per feature
+                grp = df_steps.groupby("feature", dropna=False)["delta"].sum().reset_index()
+                grp["delta"] = grp["delta"].map(lambda x: f"{x:+.3f}")
+                st.markdown("**Summary of adjustments**")
+                st.table(grp)
+
+            # Final candidate — show only the important finals
+            final_cand = out.get("final_candidate") or out.get("result") or out.get("best", {}).get("candidate")
+            if isinstance(final_cand, dict):
+                nice_keys = ["systolicbp","diastolicbp","gfr","acr","serumelectrolytespotassium","hba1c","hemoglobinlevels"]
+                pretty = { _cf_feature_nice(k): final_cand[k] for k in nice_keys if k in final_cand }
+                st.markdown("**Final candidate (key vitals)**")
+                st.json(pretty)
             else:
-                st.json(out)
+                st.caption("No final candidate returned.")
+
         except requests.HTTPError as e:
             msg = getattr(e.response, "text", str(e)) or str(e)
-            if "counterfactual not available" in msg or e.response.status_code == 503:
+            if "counterfactual not available" in msg or getattr(e.response, "status_code", 0) == 503:
                 st.info("Counterfactuals are disabled on the server. Add `api/counterfactuals.py` and restart the API.")
             else:
                 st.error("Counterfactual failed")
                 st.code(msg, language="json")
         except Exception as e:
             st.error(f"Counterfactual error: {e}")
+
+
 
 # =========================
 # Similar Patients — uses /similar
