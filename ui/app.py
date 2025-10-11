@@ -96,6 +96,30 @@ st.markdown(STYLE, unsafe_allow_html=True)
 # =========================
 # Helpers
 # =========================
+def _strip_context_echo(reply: str, ctx_text: str) -> str:
+    # Remove any line from reply that appears verbatim in the context digest
+    ctx_lines_set = set([ln.strip() for ln in ctx_text.splitlines() if ln.strip()])
+    cleaned = []
+    for ln in (reply or "").splitlines():
+        if ln.strip() in ctx_lines_set:
+            continue
+        cleaned.append(ln)
+    return "\n".join(cleaned).strip()
+
+def _enforce_min_structure(reply: str) -> str:
+    txt = (reply or "").strip()
+    if not txt:
+        return txt
+    # If the assistant forgot structure, reshape lightly
+    has_headers = any(h in txt.lower() for h in ["takeaway", "drivers", "next step"])
+    if not has_headers:
+        parts = txt.split("\n")
+        head = parts[0].strip()
+        rest = [p.strip() for p in parts[1:] if p.strip()]
+        bullets = "\n".join([f"- {p}" for p in rest[:4]])
+        txt = f"**Takeaway**\n{head}\n\n**Key drivers**\n{bullets}\n\n**Next step**\n- Consider follow-up labs / monitoring."
+    return txt
+
 def _normalize_api(url: str) -> str:
     if not url:
         return API_URL_DEFAULT
@@ -176,7 +200,7 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.2,
+        "temperature": 0.35,
     }
     try:
         r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -207,7 +231,7 @@ def call_llm(system_prompt: str, user_prompt: str):
             client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL or None)
             resp = client.chat.completions.create(
                 model=LLM_MODEL,
-                temperature=0.2,
+                temperature=0.35,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -523,38 +547,73 @@ def _build_chat_prompts(user_msg: str) -> tuple[str, str]:
     ctx_exp = st.session_state.get("ctx_explain")
 
     system_prompt = """
-You are a CKD risk assistant LIMITED to the following context objects:
-1) digital_twin_context  – results from simulations/grids (risk vs features).
-2) counterfactual_context – target-oriented change path to reduce risk.
-3) similar_context       – nearest neighbors and quick stats.
-4) explain_context       – top drivers for the last single prediction.
+You are a CKD risk assistant LIMITED to four context digests (digital_twin, counterfactual, similar, explain).
+You must synthesize insights; never quote or paraphrase raw context lines verbatim.
 
-Rules (strict):
-- Only answer using these context objects. If a question requires data not present, reply: "Out of scope for this chat. Load Digital Twin, Counterfactuals, or Similar Patients first."
-- No medication dosing or prescribing. Use plain language, include units (mmHg, mg/g, mEq/L, %).
-- Always include: “Educational tool; not medical advice.” at the end.
-- Be concise; prefer lists/tables. If giving a value, round reasonably (0–3 decimals).
-- If thresholds are referenced, explain threshold vs probability briefly, when relevant.
+Hard rules:
+- Do NOT copy the context digest back to the user. Use it only to reason.
+- Answer with short sections and bullets. Keep total output under ~180 words unless asked for more.
+- No medication dosing/prescribing. Use plain units (mmHg, mg/g, mEq/L, %).
+- If data is missing for the user’s question, say: "Out of scope for this chat. Load Digital Twin, Counterfactuals, or Similar Patients first."
+- When referencing thresholds, briefly distinguish threshold vs probability.
+- End with: "Educational tool; not medical advice."
 
-Return short, structured answers with headings when useful.
+Output format (enforce):
+1) Brief takeaway
+2) Key drivers or trade-offs (2–4 bullets)
+3) Practical next step(s)
 """.strip()
 
-    ctx_lines = ["CONTEXT START"]
+
+    def _short(x, n=6):
+        """Return up to n key:value pairs from a dict or list of dicts, as a human summary."""
+        try:
+            if isinstance(x, dict):
+                items = list(x.items())
+                return "; ".join([f"{k}={str(v)[:18]}" for k, v in items[:n]])
+            if isinstance(x, list) and x and isinstance(x[0], dict):
+                keys = list(x[0].keys())[:n]
+                return "rows=" + str(len(x)) + "; keys=" + ",".join(keys)
+            return str(x)[:120]
+        except Exception:
+            return str(x)[:120]
+
+    # Compact, human-readable context (no raw JSON)
+    ctx_lines = ["CONTEXT DIGEST"]
     if ctx_dt:
-        ctx_lines.append(f"digital_twin_context: {json.dumps(ctx_dt, ensure_ascii=False)[:6000]}")
+        ctx_lines.append(
+            "digital_twin: "
+            f"model={ctx_dt.get('model')}; thr={ctx_dt.get('threshold')}; "
+            f"swept={','.join(ctx_dt.get('swept_features', [])[:4])}; "
+            f"summary={_short(ctx_dt.get('summary', {}))}; "
+            f"sample={_short(ctx_dt.get('rows_sample', []))}"
+        )
     if ctx_cf:
-        ctx_lines.append(f"counterfactual_context: {json.dumps(ctx_cf, ensure_ascii=False)[:6000]}")
+        ctx_lines.append(
+            "counterfactual: "
+            f"model={ctx_cf.get('model')}; thr={ctx_cf.get('threshold')}; "
+            f"target={ctx_cf.get('target_prob')}; p0={ctx_cf.get('initial_prob')}; pf={ctx_cf.get('final_prob')}; "
+            f"converged={ctx_cf.get('converged')}; steps={_short(ctx_cf.get('steps', []))}"
+        )
     if ctx_sim:
-        ctx_lines.append(f"similar_context: {json.dumps(ctx_sim, ensure_ascii=False)[:6000]}")
+        ctx_lines.append(
+            "similar: "
+            f"k={ctx_sim.get('k')}; metric={ctx_sim.get('metric')}; "
+            f"summary={_short(ctx_sim.get('summary', {}))}; "
+            f"neighbors={_short(ctx_sim.get('neighbors_sample', []))}"
+        )
     if ctx_exp:
-        ctx_lines.append(f"explain_context: {json.dumps(ctx_exp, ensure_ascii=False)[:6000]}")
+        top_feats = [t.get('feature','?') for t in ctx_exp.get('top', [])[:6]]
+        ctx_lines.append(
+            "explain: "
+            f"model={ctx_exp.get('model')}; top={','.join(top_feats)}; mode={ctx_exp.get('mode')}"
+        )
     if not any([ctx_dt, ctx_cf, ctx_sim, ctx_exp]):
         ctx_lines.append("NO_CONTEXT_AVAILABLE")
-    ctx_lines.append("CONTEXT END")
-
-
     ctx_text = "\n".join(ctx_lines)
-    user_prompt = f"{ctx_text}\n\nUSER QUESTION:\n{user_msg}".strip()
+
+    user_prompt = f"{ctx_text}\n\nQUESTION:\n{user_msg}".strip()
+
    
     return system_prompt, user_prompt
 
@@ -578,10 +637,18 @@ with tab_chat:
             st.markdown(user_msg)
 
         sys_p, usr_p = _build_chat_prompts(user_msg)
-        reply = call_llm(sys_p, usr_p) or "Out of scope or no context loaded. Load Digital Twin, Counterfactuals, or Similar Patients."
+        raw_reply = call_llm(sys_p, usr_p)
 
-        if "Educational tool; not medical advice." not in (reply or ""):
+        # Post-process: remove any echoed context lines and enforce structure
+        ctx_text = usr_p.split("\n\nQUESTION:\n", 1)[0] if "\n\nQUESTION:\n" in usr_p else ""
+        reply = _strip_context_echo(raw_reply or "", ctx_text)
+        reply = _enforce_min_structure(reply)
+        if not reply:
+            reply = "Out of scope or no context loaded. Load Digital Twin, Counterfactuals, or Similar Patients."
+
+        if "Educational tool; not medical advice." not in reply:
             reply = f"{reply}\n\n*Educational tool; not medical advice.*"
+
 
         st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
         with st.chat_message("assistant"):
