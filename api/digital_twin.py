@@ -161,15 +161,15 @@ def _cartesian(arrays: List[List[float]]) -> Iterable[List[float]]:
 # Public API for FastAPI layer
 # ---------------------------------------------------------------------------
 def simulate_whatif(req: WhatIfRequest | Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Run a single what-if (base + deltas) OR a grid sweep if req.grid is provided.
-    Accepts either a Pydantic WhatIfRequest or a raw dict with matching keys.
-    """
     payload: Dict[str, Any] = req if isinstance(req, dict) else req.dict()
     base: Dict[str, float] = payload.get("base", {}) or {}
     deltas: Optional[Dict[str, float]] = payload.get("deltas") or None
     model_key: str = str(payload.get("model", "xgb")).lower()
     grid: Optional[Dict[str, List[float]]] = payload.get("grid") or None
+
+    # fetch threshold once for user-facing outputs
+    _, thr, _ = _load_artifacts(model_key)
+
 
     # Ensure base has required keys — this function doesn’t invent missing features
     missing = [c for c in FEATURE_COLS if c not in base]
@@ -181,10 +181,16 @@ def simulate_whatif(req: WhatIfRequest | Dict[str, Any]) -> Dict[str, Any]:
         p_ckd, p_non = _predict_probs(row, model_key)
         return {
             "mode": "single",
-            "rows": [row],
-            "probs": [{"prob_ckd": p_ckd, "prob_non_ckd": p_non}],
             "model": model_key,
+            "threshold_used": thr,
+            "rows": [{
+                **row,
+                "prob_ckd": p_ckd,
+                "prob_non_ckd": p_non,
+                "flag": float(p_ckd) >= float(thr)
+            }]
         }
+
 
     feats = list(grid.keys())
     grids = [grid[f] for f in feats]
@@ -199,10 +205,21 @@ def simulate_whatif(req: WhatIfRequest | Dict[str, Any]) -> Dict[str, Any]:
         rows.append(row)
         probs.append({"prob_ckd": p_ckd, "prob_non_ckd": p_non})
 
+    # merge rows + probs and compute flags for a table-friendly structure
+    merged: List[Dict[str, float]] = []
+    for r, p in zip(rows, probs):
+        merged.append({
+            **r,
+            "prob_ckd": p["prob_ckd"],
+            "prob_non_ckd": p["prob_non_ckd"],
+            "flag": float(p["prob_ckd"]) >= float(thr)
+        })
+
     return {
         "mode": "grid",
-        "features": feats,
-        "rows": rows,
-        "probs": probs,
         "model": model_key,
+        "threshold_used": thr,
+        "swept_features": feats,
+        "rows": merged
     }
+
