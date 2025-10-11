@@ -619,7 +619,7 @@ with tab_single:
                 with cols[idx]:
                     prob = float(res.get("prob_ckd", 0.0))
                     thr  = float(res.get("threshold_used", 0.5))
-                    st.markdown("**Plain-English result**")
+                    st.markdown("**What it means**")
                     st.markdown("This model would **flag** for CKD **follow-up**." if prob >= thr else "This model would **not** flag for CKD at this time.")
             except requests.HTTPError as e:
                 with cols[idx]:
