@@ -1561,68 +1561,69 @@ with tab_batch:
     retrain_after_batch = st.checkbox("Start training after batch (optional)", value=False, key="batch_retrain")
 
 
-    if file:
-        try:
-            df = pd.read_csv(file)
-            missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
-            if missing:
-                st.error(f"Missing columns: {missing}")
-            else:
-                st.dataframe(df.head())
-                    if st.button("Run batch with selected models", key="btn_run_batch"):
-                        st.session_state["batch_preds"] = {}
-                        summary_rows = []
-                        for m in selected_models:
-                            try:
-                                rows = df[FEATURE_COLUMNS].to_dict(orient="records")
-                                rows = [sanitize_payload(r) for r in rows]
-                                r = _api_post(
-                                    f"{st.session_state['api_url']}/predict/batch",
-                                    params={"model": m},
-                                    json_body={"rows": rows},
-                                    timeout=120
-                                )
-                                preds = pd.DataFrame(r["predictions"])
-                                preds["model_used"] = m
-                                st.session_state["batch_preds"][m] = preds
-        
-                                ckd_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
-                                avg_prob = preds["prob_ckd"].mean() if "prob_ckd" in preds else 0.0
-                                thr = preds["threshold_used"].iloc[0] if "threshold_used" in preds and not preds.empty else None
-                                summary_rows.append({
-                                    "Model": MODEL_KEYS.get(m, m),
-                                    "Positive rate": f"{ckd_rate:.1%}",
-                                    "Avg Prob_CKD": f"{avg_prob:.3f}",
-                                    "Threshold": f"{thr:.3f}" if thr is not None else "—",
-                                    "Rows": len(preds)
-                                })
-                                _log(f"Batch OK ({m}) rows={len(preds)}")
-                            except requests.HTTPError as e:
-                                st.error(f"{MODEL_KEYS.get(m,m)} failed")
-                                st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
-                                _log(f"Batch HTTP ERROR ({m}): {e}")
-                            except Exception as e:
-                                st.error(f"{MODEL_KEYS.get(m,m)} error")
-                                st.caption(str(e))
-                                _log(f"Batch ERROR ({m}): {e}")
-        
-                        if summary_rows:
-                            st.success("Batch complete.")
-                            st.markdown("#### Model comparison (batch summary)")
-                            st.table(pd.DataFrame(summary_rows))
-        
-                            merged_list = []
-                            for m, preds in st.session_state["batch_preds"].items():
-                                merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
-                                merged_list.append(merged.assign(model_used=m))
-                                st.download_button(
-                                    f"Download {MODEL_KEYS.get(m,m)} results",
-                                    data=merged.to_csv(index=False).encode("utf-8"),
-                                    file_name=f"batch_results_{m}.csv",
-                                    mime="text/csv",
-                                    key=f"dl_batch_{m}"
-                                )
-            except Exception as e:
-                st.error(f"Error processing CSV file: {e}")
-    
+if file:
+    try:
+        df = pd.read_csv(file)
+        missing = [c for c in FEATURE_COLUMNS if c not in df.columns]
+        if missing:
+            st.error(f"Missing columns: {missing}")
+        else:
+            st.dataframe(df.head())
+
+            if st.button("Run batch with selected models", key="btn_run_batch"):
+                st.session_state["batch_preds"] = {}
+                summary_rows = []
+
+                for m in selected_models:
+                    try:
+                        rows = df[FEATURE_COLUMNS].to_dict(orient="records")
+                        rows = [sanitize_payload(r) for r in rows]
+                        r = _api_post(
+                            f"{st.session_state['api_url']}/predict/batch",
+                            params={"model": m},
+                            json_body={"rows": rows},
+                            timeout=120
+                        )
+                        preds = pd.DataFrame(r["predictions"])
+                        preds["model_used"] = m
+                        st.session_state["batch_preds"][m] = preds
+
+                        ckd_rate = preds["prediction"].mean() if "prediction" in preds else 0.0
+                        avg_prob = preds["prob_ckd"].mean() if "prob_ckd" in preds else 0.0
+                        thr = preds["threshold_used"].iloc[0] if "threshold_used" in preds and not preds.empty else None
+                        summary_rows.append({
+                            "Model": MODEL_KEYS.get(m, m),
+                            "Positive rate": f"{ckd_rate:.1%}",
+                            "Avg Prob_CKD": f"{avg_prob:.3f}",
+                            "Threshold": f"{thr:.3f}" if thr is not None else "—",
+                            "Rows": len(preds)
+                        })
+                        _log(f"Batch OK ({m}) rows={len(preds)}")
+                    except requests.HTTPError as e:
+                        st.error(f"{MODEL_KEYS.get(m,m)} failed")
+                        st.code(getattr(e.response, "text", str(e)) or str(e), language="json")
+                        _log(f"Batch HTTP ERROR ({m}): {e}")
+                    except Exception as e:
+                        st.error(f"{MODEL_KEYS.get(m,m)} error")
+                        st.caption(str(e))
+                        _log(f"Batch ERROR ({m}): {e}")
+
+                if summary_rows:
+                    st.success("Batch complete.")
+                    st.markdown("#### Model comparison (batch summary)")
+                    st.table(pd.DataFrame(summary_rows))
+
+                    merged_list = []
+                    for m, preds in st.session_state["batch_preds"].items():
+                        merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
+                        merged_list.append(merged.assign(model_used=m))
+                        st.download_button(
+                            f"Download {MODEL_KEYS.get(m,m)} results",
+                            data=merged.to_csv(index=False).encode("utf-8"),
+                            file_name=f"batch_results_{m}.csv",
+                            mime="text/csv",
+                            key=f"dl_batch_{m}"
+                        )
+    except Exception as e:
+        st.error(f"Error processing CSV file: {e}")
     
