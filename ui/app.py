@@ -1637,10 +1637,7 @@ with tab_batch:
                                 rr = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
                                 if rr.status_code in (200, 202):
                                     st.success("Training started. Check API health above.")
-                           except Exception as e:
+                     except Exception as e:
                                 st.error(f"Failed to start training: {e}")
                                 _log(f"Batch retrain ERROR: {e}")
-                                
 
-                                st.error(f"Failed to start training: {e}")
-                                _log(f"Batch retrain ERROR: {e}")
