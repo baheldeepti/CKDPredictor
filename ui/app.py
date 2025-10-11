@@ -1308,12 +1308,31 @@ with tab_counterfactuals:
 
             final_cand = out.get("final_candidate") or out.get("result") or out.get("best", {}).get("candidate")
             if isinstance(final_cand, dict):
-                nice_keys = ["systolicbp","diastolicbp","gfr","acr","serumelectrolytespotassium","hba1c","hemoglobinlevels"]
-                pretty = { _cf_feature_nice(k): final_cand[k] for k in nice_keys if k in final_cand }
-                st.markdown("**Final candidate (key vitals)**")
-                st.json(pretty)
+                st.markdown("**Final candidate — key vitals (readable)**")
+                rows = []
+
+                def _add_row(label: str, key: str, unit: str, nd: int):
+                    if key in final_cand:
+                        try:
+                            v = round(float(final_cand[key]), nd)
+                            if nd == 0:
+                                v = int(v)
+                            rows.append({"Measure": label, "Value": f"{v}", "Unit": unit})
+                        except Exception:
+                            rows.append({"Measure": label, "Value": str(final_cand[key]), "Unit": unit})
+
+                _add_row("Systolic BP", "systolicbp", "mmHg", 0)
+                _add_row("Diastolic BP", "diastolicbp", "mmHg", 0)
+                _add_row("GFR", "gfr", "mL/min/1.73m²", 0)
+                _add_row("ACR", "acr", "mg/g", 0)
+                _add_row("Potassium", "serumelectrolytespotassium", "mEq/L", 1)
+                _add_row("HbA1c", "hba1c", "%", 1)
+                _add_row("Hemoglobin", "hemoglobinlevels", "g/dL", 1)
+
+                st.table(pd.DataFrame(rows))
             else:
                 st.caption("No final candidate returned.")
+
 
         except requests.HTTPError as e:
             msg = getattr(e.response, "text", str(e)) or str(e)
