@@ -68,195 +68,253 @@ APP_TITLE = st.secrets.get("APP_TITLE", APP_TITLE_HUMAN)
 st.set_page_config(page_title=APP_TITLE_HUMAN, page_icon="🩺", layout="wide")
 
 # -------------------------
-# Pro Medical Theme (CSS)
+# PREMIUM UI THEME (CSS)
 # -------------------------
 STYLE = """
 <style>
+/* =========================
+   Design Tokens — Healthcare UI
+   ========================= */
 :root {
-  /* --- Color System (Healthcare) --- */
-  --brand-600:#0E7490; /* teal-700 */
-  --brand-500:#0EA5A9; /* teal-500 */
-  --brand-400:#2DD4BF; /* teal-400 accent */
-  --brand-300:#5EEAD4;
-  --brand-50:#F0FDFA;
+  /* Core palette: calm clinical blues/teals, clean grays, clear accents */
+  --brand-900:#0B3B5A;
+  --brand-800:#114C74;
+  --brand-700:#165D8F;
+  --brand-600:#1B6EA9;
+  --brand-500:#1F7FC4; /* Primary */
+  --brand-400:#4798CF;
+  --brand-300:#74B3DB;
+  --brand-200:#A4CDE7;
+  --brand-100:#D2E7F3;
 
-  --ink-900:#0B1220;
-  --ink-800:#1F2937;
-  --ink-700:#374151;
-  --ink-600:#4B5563;
-  --ink-500:#6B7280;
-  --ink-400:#9CA3AF;
-  --ink-300:#D1D5DB;
-  --ink-200:#E5E7EB;
-  --ink-100:#F3F4F6;
-  --ink-50:#F9FAFB;
+  --teal-600:#0F766E;  /* Secondary accent */
+  --teal-100:#D1FAF5;
 
-  --success-600:#15803D;
-  --success-100:#DCFCE7;
-  --warning-600:#B45309;
-  --warning-100:#FEF3C7;
-  --danger-600:#B91C1C;
-  --danger-100:#FEE2E2;
-  --info-600:#0369A1;
-  --info-100:#E0F2FE;
+  --ok-700:#126B3F;    /* Status: success */
+  --ok-100:#E7F6EE;
 
-  /* Surfaces */
-  --bg:#F7FAFC;                /* page background */
-  --surface:#FFFFFF;           /* cards */
-  --surface-alt:#FBFEFF;       /* subtle alternative */
-  --border:#E5E9EF;
-  --shadow: 0 1px 1px rgba(16,24,40,0.04), 0 1px 3px rgba(16,24,40,0.08);
-  --shadow-lg: 0 8px 24px rgba(16,24,40,0.10);
+  --warn-700:#8A5B0A;  /* Status: warning */
+  --warn-100:#FFF3D6;
 
-  /* Typography */
-  --font: Inter, "SF Pro Text", -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
-  --h1: clamp(26px, 2.4vw, 32px);
-  --h2: clamp(20px, 2vw, 24px);
-  --h3: clamp(16px, 1.6vw, 18px);
-  --body: 15px;
-  --caption: 12.5px;
+  --bad-700:#8E1E28;   /* Status: error */
+  --bad-100:#FBE6E8;
 
-  /* Radius & Spacing */
-  --radius: 14px;
-  --radius-sm: 10px;
-  --gap-2: 8px;
-  --gap-3: 12px;
-  --gap-4: 16px;
-  --gap-5: 20px;
-  --gap-6: 24px;
+  --info-700:#1E4E79;
+  --info-100:#E5F1FB;
+
+  --fg-900:#0F172A;    /* Neutral / text */
+  --fg-800:#1F2937;
+  --fg-700:#334155;
+  --fg-600:#475569;
+  --fg-500:#64748B;
+  --fg-400:#94A3B8;
+
+  --border-300:#E2E8F0;
+  --border-200:#EDF2F7;
+
+  --bg-0:#F7FAFC;      /* App background */
+  --bg-1:#FFFFFF;      /* Surfaces / cards */
+  --bg-2:#F1F5F9;      /* Subtle backgrounds (chips, tabs) */
+
+  --shadow-sm:0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 1px rgba(16, 24, 40, 0.04);
+  --shadow-md:0 6px 16px rgba(2, 32, 71, 0.08), 0 2px 4px rgba(2, 32, 71, 0.06);
+  --shadow-lg:0 12px 24px rgba(2, 32, 71, 0.10), 0 4px 8px rgba(2, 32, 71, 0.06);
+
+  --radius-sm:10px;
+  --radius-md:14px;
+  --radius-lg:18px;
+
+  --focus: 0 0 0 3px rgba(31,127,196,0.25); /* Accessible focus ring */
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Noto Sans", "Apple Color Emoji", "Segoe UI Emoji";
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
 }
 
-/* Base */
+/* Base layout */
 html, body, [class^="css"]  {
-  font-family: var(--font);
-  color: var(--ink-800);
-  background: linear-gradient(180deg, var(--bg) 0%, #FFFFFF 600px) fixed;
+  font-family: var(--font-sans);
+  color: var(--fg-800);
+  background: var(--bg-0);
 }
-section.main > div { padding-top: 0.25rem !important; }
-h1 { font-size: var(--h1); font-weight: 750; letter-spacing:-0.01em; color: var(--ink-900); margin: 2px 0 6px; }
-h2 { font-size: var(--h2); font-weight: 700; color: var(--ink-900); margin-top: var(--gap-6); margin-bottom: var(--gap-3); }
-h3 { font-size: var(--h3); font-weight: 650; color: var(--ink-900); margin-top: var(--gap-4); margin-bottom: var(--gap-2); }
-p, li, label, span, div { font-size: var(--body); }
-.small-muted { color: var(--ink-600); font-size: var(--caption); }
-.top-chip { font-size: var(--caption); color: var(--ink-600); margin-top: -4px; }
-.block-info { font-size: 13.5px; color: var(--ink-700); }
+
+/* Tighten page padding slightly for a dashboard feel */
+section.main > div { padding-top: 0.6rem !important; }
+
+/* Typography hierarchy */
+h1, h2, h3 { letter-spacing: -0.01em; color: var(--fg-900); }
+h1 { font-weight: 800; font-size: 1.875rem; line-height: 1.2; margin: 0.25rem 0 0.25rem; }
+h2 { font-weight: 700; font-size: 1.25rem; line-height: 1.35; margin: 0.4rem 0 0.3rem; }
+h3 { font-weight: 700; font-size: 1.05rem; line-height: 1.35; margin: 0.4rem 0 0.3rem; }
+
+p, .block-info { font-size: 0.95rem; line-height: 1.6; color: var(--fg-700); }
+.small-muted, .caption, .tooltip { color: var(--fg-500); font-size: 0.80rem; }
+.top-chip { color: var(--fg-500); font-size: 0.80rem; margin-top: -6px; }
+
+/* Links */
+a { color: var(--brand-600); text-decoration: none; }
+a:hover { text-decoration: underline; }
 
 /* Cards */
 .card  {
   padding: 16px 18px;
-  border-radius: var(--radius);
-  border: 1px solid var(--border);
-  background: linear-gradient(180deg, var(--surface) 0%, var(--surface-alt) 100%);
-  box-shadow: var(--shadow);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-300);
+  background: var(--bg-1);
+  box-shadow: var(--shadow-sm);
 }
-.card--elevated { box-shadow: var(--shadow-lg); }
-.card--header {
-  display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:10px;
-}
-.card--meta { color: var(--ink-600); font-size: var(--caption); }
+.card:hover { box-shadow: var(--shadow-md); transition: box-shadow 160ms ease; }
 
-/* Badges */
-.badge {
-  padding: 2px 10px; border-radius: 999px; font-weight: 650; display:inline-flex; align-items:center; gap:6px;
-  border: 1px solid transparent; letter-spacing: 0.02em; font-size: 12.5px;
-}
-.badge--success { color: var(--success-600); background: var(--success-100); border-color:#C7F9D4; }
-.badge--warning { color: var(--warning-600); background: var(--warning-100); border-color:#FDE68A; }
-.badge--danger  { color: var(--danger-600);  background: var(--danger-100);  border-color:#FCA5A5; }
-.badge--info    { color: var(--info-600);    background: var(--info-100);    border-color:#BAE6FD; }
-
-/* Status dot */
-.status-dot { width:8px; height:8px; border-radius:999px; display:inline-block; }
-.status--success { background: var(--success-600); }
-.status--warning { background: var(--warning-600); }
-.status--danger  { background: var(--danger-600); }
-.status--info    { background: var(--info-600); }
+/* Soft section dividers */
+hr { border: none; border-top: 1px solid var(--border-300); margin: 0.75rem 0 1.25rem; }
 
 /* Buttons */
-.stButton>button, .stDownloadButton>button {
+.stButton>button,
+.stDownloadButton>button {
+  appearance: none;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border);
-  background: linear-gradient(180deg, #FFFFFF 0%, #F8FBFC 100%);
-  color: var(--ink-800);
-  padding: 8px 12px;
-  transition: all .15s ease;
-  box-shadow: 0 1px 2px rgba(16,24,40,0.05);
+  border: 1px solid rgba(31,127,196,0.25);
+  background: linear-gradient(180deg, var(--brand-500), var(--brand-600));
+  color: white;
+  font-weight: 600;
+  padding: 0.55rem 0.9rem;
+  box-shadow: var(--shadow-sm);
 }
-.stButton>button:hover, .stDownloadButton>button:hover {
-  transform: translateY(-1px);
-  box-shadow: var(--shadow);
-  border-color: #D5E4EA;
+.stButton>button:hover,
+.stDownloadButton>button:hover {
+  filter: brightness(0.98);
+  box-shadow: var(--shadow-md);
 }
-.stButton>button:focus-visible, .stDownloadButton>button:focus-visible {
-  outline: 3px solid rgba(14,165,169,0.2); outline-offset: 2px;
-  border-color: var(--brand-500);
-}
-.stButton>button[kind="primary"], .stButton>button:where(.primary) {
-  background: linear-gradient(180deg, var(--brand-500) 0%, var(--brand-600) 100%);
-  color:#fff; border-color: transparent;
-}
-.stButton>button[kind="primary"]:hover, .stButton>button.primary:hover {
-  filter: brightness(1.02);
-  box-shadow: 0 6px 18px rgba(14,117,144,0.28);
+.stButton>button:focus,
+.stDownloadButton>button:focus { outline: none; box-shadow: var(--focus); }
+.stButton>button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* Secondary (outlined) buttons inside columns — use data attribute when present */
+button[kind="secondary"] {
+  background: var(--bg-1);
+  border-color: var(--border-300);
+  color: var(--brand-700);
 }
 
-/* Inputs */
-.stTextInput>div>div>input,
-.stNumberInput>div>div>input,
-.stSelectbox>div>div>div>div,
-.stTextArea textarea {
-  border-radius: var(--radius-sm)!important;
-  border: 1px solid var(--border)!important;
-  background:#fff!important;
-  box-shadow: inset 0 0 0 0 rgba(0,0,0,0)!important;
+/* Inputs & Forms */
+.stTextInput input,
+.stNumberInput input,
+.stTextArea textarea,
+.stSelectbox div[data-baseweb="select"]>div,
+.stDateInput input {
+  border-radius: var(--radius-sm) !important;
+  border: 1px solid var(--border-300) !important;
+  background: #FFFFFF !important;
+  box-shadow: none !important;
 }
-.stTextInput>div>div>input:focus,
-.stNumberInput>div>div>input:focus,
-.stSelectbox:focus-within,
-.stTextArea textarea:focus {
-  border-color: #C6EEF1!important;
-  box-shadow: 0 0 0 3px rgba(14,165,169,0.16)!important;
+.stTextInput input:focus,
+.stNumberInput input:focus,
+.stTextArea textarea:focus,
+.stDateInput input:focus {
+  outline: none !important;
+  box-shadow: var(--focus) !important;
+  border-color: var(--brand-500) !important;
 }
+
+/* Sliders & checkboxes (subtle) */
+.stSlider [role="slider"] { border-color: var(--brand-500) !important; }
+.stCheckbox input[type="checkbox"] { accent-color: var(--brand-600); }
 
 /* Tabs */
-[role="tablist"] { gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
-button[role="tab"] {
-  border-radius: 10px 10px 0 0;
-  padding: 8px 12px; font-weight: 600; color: var(--ink-700);
-  background: transparent; border: none; border-bottom: 3px solid transparent;
+.stTabs [data-baseweb="tab-list"] {
+  border-bottom: 1px solid var(--border-300);
+  margin-bottom: 0.5rem;
 }
-button[role="tab"][aria-selected="true"] {
-  color: var(--brand-600); background: var(--brand-50);
-  border-bottom: 3px solid var(--brand-500);
+.stTabs [data-baseweb="tab"] {
+  background: transparent;
+  color: var(--fg-600);
+  border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+  padding: 0.5rem 0.9rem;
+}
+.stTabs [aria-selected="true"] {
+  color: var(--brand-700);
+  font-weight: 700;
+  background: var(--bg-1);
+  border: 1px solid var(--border-300);
+  border-bottom-color: var(--bg-1);
+  box-shadow: var(--shadow-sm);
 }
 
 /* Expanders */
 .streamlit-expanderHeader {
-  font-weight: 700; color: var(--ink-800);
+  font-weight: 700;
+  color: var(--fg-800);
 }
 .st-expander {
-  border: 1px solid var(--border); border-radius: var(--radius);
-  background: #fff; box-shadow: var(--shadow);
+  border: 1px solid var(--border-300);
+  border-radius: var(--radius-md);
+  background: var(--bg-1);
+  box-shadow: var(--shadow-sm);
 }
 
-/* Tables & DataFrames */
-.stTable, .stDataFrame {
-  border-radius: var(--radius); border: 1px solid var(--border);
-  overflow: hidden; box-shadow: var(--shadow);
+/* Dataframes & Tables */
+.stDataFrame, .stTable {
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  box-shadow: var(--shadow-sm);
 }
-.stTable table thead th {
-  background: #F5FAFB; color: var(--ink-700); font-weight:700; font-size: 13px;
-  border-bottom: 1px solid var(--border);
-}
-.stTable table tbody tr:nth-child(even) { background:#FCFEFF; }
+thead tr th { background: var(--bg-2) !important; color: var(--fg-700) !important; }
 
 /* Code blocks */
-pre, code { white-space: pre-wrap; font-size: 13px; }
-code { background: #F6F8FB; border:1px solid var(--border); border-radius: 8px; padding: 2px 6px; }
+pre, code {
+  white-space: pre-wrap;
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  background: #0b2942;
+  color: #e6edf3;
+  border-radius: var(--radius-sm);
+  padding: 0.5rem 0.6rem;
+}
 
-/* Misc */
-hr { border: none; border-top:1px solid var(--border); margin: 6px 0 16px; }
-.stCaption, .st-emotion-cache-gi0tri { color: var(--ink-600)!important; }
+/* Badges & status chips */
+.badge {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-weight: 700;
+  display: inline-block;
+  font-size: 0.8rem;
+  border: 1px solid var(--border-300);
+  background: var(--bg-2);
+  color: var(--fg-700);
+}
+.badge.is-ok       { background: var(--ok-100);   color: var(--ok-700);   border-color: #CDE9DB; }
+.badge.is-warn     { background: var(--warn-100); color: var(--warn-700); border-color: #FFE7B0; }
+.badge.is-bad      { background: var(--bad-100);  color: var(--bad-700);  border-color: #F6B9BF; }
+.badge.is-info     { background: var(--info-100); color: var(--info-700); border-color: #BFDDF8; }
+.badge.is-brand    { background: var(--brand-100);color: var(--brand-700);border-color: var(--brand-200); }
+
+/* KPI blocks */
+.kpi {
+  display:flex; gap:18px; flex-wrap:wrap; align-items:flex-end;
+}
+.kpi .metric { min-width: 120px; }
+.kpi .metric b { display:block; font-size:0.8rem; color: var(--fg-600); }
+.kpi .metric span { font-size:1.25rem; font-weight:800; color: var(--fg-900); }
+
+/* Subtle surfaces & hover rows */
+.surface { background: var(--bg-1); border:1px solid var(--border-300); border-radius: var(--radius-md); box-shadow: var(--shadow-sm); }
+.table-hover tbody tr:hover { background: #F8FBFF; }
+
+/* Plotly container spacing */
+.element-container:has(.plotly) { padding: 6px; }
+
+/* Sidebar polish */
+.css-1d391kg, .stSidebar { background: linear-gradient(180deg, #F8FBFE, #F7FAFC); }
+.css-1d391kg .sidebar-content { padding-top: 0.5rem; }
+
+/* Accessibility: ensure focus visibility for clickable elements */
+button:focus-visible, a:focus-visible, [role="tab"]:focus-visible { outline: none; box-shadow: var(--focus); }
+
+/* Utility helpers */
+.muted { color: var(--fg-500); }
+.shadow-sm { box-shadow: var(--shadow-sm); }
+.shadow-md { box-shadow: var(--shadow-md); }
+.shadow-lg { box-shadow: var(--shadow-lg); }
+.round-lg { border-radius: var(--radius-lg); }
 </style>
 """
 st.markdown(STYLE, unsafe_allow_html=True)
@@ -619,10 +677,8 @@ with top_left:
     selected_models = [MODEL_LABELS[l] for l in picked_labels] or ["rf"]
 
     st.markdown(
-        "<div class='top-chip'>"
-        "<b>Train models</b> retrains on the server • "
-        "<b>Reload models</b> refreshes cached artifacts"
-        "</div>",
+        "<div class='top-chip'><b>Train models</b> retrains on the server • "
+        "<b>Reload models</b> refreshes cached artifacts</div>",
         unsafe_allow_html=True
     )
 
@@ -941,17 +997,18 @@ with tab_single:
                     thr  = float(res.get("threshold_used", 0.5))
                     model_used = res.get("model_used", m)
                     label = "Above threshold" if prob >= thr else ("Moderate risk" if prob >= 0.33 else "Lower risk")
-                    bg, col = ("#fee2e2", "#991b1b") if prob >= thr else (("#fef3c7","#92400e") if prob >=0.33 else ("#dcfce7","#065f46"))
+                    # Use tokenized badge variants for consistent polish
+                    badge_cls = "is-bad" if prob >= thr else ("is-warn" if prob >= 0.33 else "is-ok")
                     st.markdown(
                         f"""
                         <div class="card">
                           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                            <div style="font-size:18px;font-weight:700;">{MODEL_KEYS.get(model_used, model_used)}</div>
-                            <div class="badge" style="background:{bg};color:{col}">{label}</div>
+                            <div style="font-size:18px;font-weight:800;color:var(--brand-800);">{MODEL_KEYS.get(model_used, model_used)}</div>
+                            <div class="badge {badge_cls}">{label}</div>
                           </div>
-                          <div style="display:flex;gap:24px;flex-wrap:wrap;">
-                            <div><strong>Probability of CKD</strong><br><span style="font-size:20px;">{prob:.3f}</span></div>
-                            <div><strong>Decision Threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+                          <div class="kpi">
+                            <div class="metric"><b>Probability of CKD</b><span>{prob:.3f}</span></div>
+                            <div class="metric"><b>Decision Threshold</b><span>{thr:.3f}</span></div>
                           </div>
                           <div class="small-muted" style="margin-top:8px;">
                             A probability at or above the threshold is flagged for CKD follow-up by this model.
@@ -1196,7 +1253,7 @@ Task (format output as short sections with bullets):
                 f"""
                 <div class="card">
                   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                    <div style="font-weight:700">Cohort Insights — {MODEL_KEYS.get(chosen_m, chosen_m)}</div>
+                    <div style="font-weight:800;color:var(--brand-800)">Cohort Insights — {MODEL_KEYS.get(chosen_m, chosen_m)}</div>
                     <div class="small-muted">Positive rate {pos_rate:.1%} • Avg Prob_CKD {avg_prob:.3f} • Rows {len(preds)}</div>
                   </div>
                   <div style="line-height:1.55">{insights_html}</div>
@@ -1318,7 +1375,7 @@ Constraints:
                     f"""
                     <div class="card">
                       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
-                        <div style="font-weight:700">AI next steps — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
+                        <div style="font-weight:800;color:var(--brand-800)">AI next steps — {MODEL_KEYS.get(chosen_key, chosen_key)}</div>
                         <div class="small-muted">Prob_CKD {prob_ckd:.3f}</div>
                       </div>
                       <div style="line-height:1.55">{text_html}</div>
@@ -1444,16 +1501,17 @@ with tab_digital_twin:
                 thr = float(out.get("threshold_used", 0.5))
                 flag = prob >= thr
 
+                badge_cls = "is-bad" if flag else "is-ok"
                 st.markdown(
                     f"""
                     <div class="card">
                       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                        <div style="font-size:18px;font-weight:700;">{MODEL_KEYS.get(model_key_sim, model_key_sim)}</div>
-                        <div class="badge" style="background:{'#fee2e2' if flag else '#dcfce7'};color:{'#991b1b' if flag else '#065f46'}">{'Flagged' if flag else 'Not flagged'}</div>
+                        <div style="font-size:18px;font-weight:800;color:var(--brand-800);">{MODEL_KEYS.get(model_key_sim, model_key_sim)}</div>
+                        <div class="badge {badge_cls}">{'Flagged' if flag else 'Not flagged'}</div>
                       </div>
-                      <div style="display:flex;gap:24px;flex-wrap:wrap;">
-                        <div><strong>Probability</strong><br><span style="font-size:20px;">{prob:.3f}</span></div>
-                        <div><strong>Decision threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+                      <div class="kpi">
+                        <div class="metric"><b>Probability</b><span>{prob:.3f}</span></div>
+                        <div class="metric"><b>Decision threshold</b><span>{thr:.3f}</span></div>
                       </div>
                     </div>
                     """,
@@ -1673,14 +1731,14 @@ with tab_counterfactuals:
                 f"""
                 <div class="card">
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                        <div style="font-weight:700">{MODEL_KEYS.get(model_key_cf, model_key_cf)} plan</div>
-                        <div class="badge" style="background:{'#fee2e2' if flag else '#dcfce7'};color:{'#991b1b' if flag else '#065f46'}">{'Flagged at end' if flag else 'Below threshold'}</div>
+                        <div style="font-weight:800;color:var(--brand-800)">{MODEL_KEYS.get(model_key_cf, model_key_cf)} plan</div>
+                        <div class="badge {'is-bad' if flag else 'is-ok'}">{'Flagged at end' if flag else 'Below threshold'}</div>
                     </div>
-                    <div style="display:flex;gap:24px;flex-wrap:wrap;">
-                        <div><strong>Start prob</strong><br><span style="font-size:20px;">{p0:.3f}</span></div>
-                        <div><strong>Target prob</strong><br><span style="font-size:20px;">{float(out.get('target_prob', target_prob)):.3f}</span></div>
-                        <div><strong>Final prob</strong><br><span style="font-size:20px;">{pf:.3f}</span></div>
-                        <div><strong>Threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+                    <div class="kpi">
+                        <div class="metric"><b>Start prob</b><span>{p0:.3f}</span></div>
+                        <div class="metric"><b>Target prob</b><span>{float(out.get('target_prob', target_prob)):.3f}</span></div>
+                        <div class="metric"><b>Final prob</b><span>{pf:.3f}</span></div>
+                        <div class="metric"><b>Threshold</b><span>{thr:.3f}</span></div>
                     </div>
                 </div>
                 """,
