@@ -1,11 +1,10 @@
-# ui/app.py
 import os
 import json
 import math
 import requests
 import streamlit as st
 import pandas as pd
-import plotly.express as px  # NEW
+import plotly.express as px
 from typing import Dict, Any, List, Tuple
 
 # =========================
@@ -88,6 +87,7 @@ def nl2br(s: str) -> str:
         return s.replace("\n", "<br/>")
     except Exception:
         return s
+
 def _cf_feature_nice(f: str) -> str:
     names = {
         "systolicbp":"Systolic BP", "diastolicbp":"Diastolic BP", "gfr":"GFR", "acr":"ACR",
@@ -95,7 +95,6 @@ def _cf_feature_nice(f: str) -> str:
         "hba1c":"HbA1c", "hemoglobinlevels":"Hemoglobin"
     }
     return names.get(f, f)
-
 
 def sanitize_payload(d: dict) -> dict:
     out = {}
@@ -108,7 +107,6 @@ def sanitize_payload(d: dict) -> dict:
         try:
             out[k] = float(v)
         except Exception:
-            # gender, flags, stages: coerce safely
             try:
                 out[k] = float(int(v))
             except Exception:
@@ -123,6 +121,22 @@ def safe_json_loads(txt: str, fallback: dict = None) -> dict:
         return json.loads(txt)
     except Exception:
         return fallback if fallback is not None else {}
+
+# ---- New tiny helpers (for What-If compatibility)
+def _get_threshold(api_base: str, model_key: str, default: float = 0.5) -> float:
+    """Fetch decision threshold from /health for a given model key."""
+    try:
+        h = _api_get(f"{api_base}/health", params={"model": model_key}, timeout=10)
+        return float(h.get("threshold", default))
+    except Exception:
+        return float(default)
+
+def _bool_flag(prob_ckd: float, thr: float) -> bool:
+    """Whether a probability crosses threshold."""
+    try:
+        return float(prob_ckd) >= float(thr)
+    except Exception:
+        return False
 
 def _risk_badge(prob_ckd: float, thr: float) -> tuple[str, str, str]:
     if prob_ckd >= thr:
@@ -159,15 +173,13 @@ def _api_get(url: str, params: dict | None = None, timeout: int = 30):
 
 def _api_post(url: str, json_body: dict | None = None, params: dict | None = None, timeout: int = 60):
     r = requests.post(url, params=params, json=json_body, timeout=timeout)
-    # Better errors: pass-through JSON if available
     if r.status_code >= 400:
         try:
             detail = r.json()
         except Exception:
             detail = r.text
-        # raise HTTPError but attach a stringified payload so UI can branch on it
         e = requests.HTTPError(f"{r.status_code}: {detail}")
-        e.response = r  # keep original
+        e.response = r
         raise e
     return r.json()
 
@@ -259,6 +271,7 @@ def sample_records_df():
         [58, 1, 170, 110, 4.6, 60, 28, 750, 135, 6.2, 10.8, 8.3, 60, 13.0, 4, 3, 1, 1, 1],
     ]
     return pd.DataFrame(rows, columns=FEATURE_COLUMNS)
+
 GRID_SWEEP_HELP = """
 **What is a grid sweep?** Pick one or more knobs (e.g., SBP, GFR, ACR), give each a list of target values,
 and we simulate **every combination** to see how the risk changes. It’s like trying out all “what-if”
@@ -270,7 +283,6 @@ def parse_csv_single_row(upload) -> dict | None:
         df = pd.read_csv(upload)
         if df.empty:
             return None
-        # keep only known features; fill missing with 0
         for c in FEATURE_COLUMNS:
             if c not in df.columns:
                 df[c] = 0.0
@@ -287,12 +299,10 @@ def pretty_feature_name(f: str) -> str:
     }
     return mapping.get(f, f)
 
-
 # =========================
 # Local fallback explainer
 # =========================
 def _safe_predict_prob(api_base: str, payload: Dict[str, Any], model_key: str) -> float:
-    """Ask backend /predict and return prob_ckd, or 0.0 if it fails."""
     try:
         res = _api_post(f"{api_base}/predict", json_body=payload, params={"model": model_key}, timeout=20)
         return float(res.get("prob_ckd", 0.0))
@@ -302,17 +312,12 @@ def _safe_predict_prob(api_base: str, payload: Dict[str, Any], model_key: str) -
 def _sensitivity_top_drivers(
     api_base: str, base_payload: Dict[str, Any], model_key: str, probe_features: List[str], k: int = 8
 ) -> List[Dict[str, float]]:
-    """
-    Fallback 'top drivers': finite-difference sensitivity.
-    For each feature f, nudge +δ and -δ and take the larger absolute change in prob.
-    """
     base_prob = _safe_predict_prob(api_base, base_payload, model_key)
     rows = []
     for f in probe_features:
         if f not in base_payload:
             continue
         v = float(base_payload[f])
-        # sensible per-feature small step
         if f in ("systolicbp", "diastolicbp"): delta = 5.0
         elif f in ("gfr",): delta = 5.0
         elif f in ("acr",): delta = max(5.0, abs(v) * 0.05)
@@ -332,27 +337,18 @@ def _sensitivity_top_drivers(
         p_up = _safe_predict_prob(api_base, sanitize_payload(up), model_key)
         p_dn = _safe_predict_prob(api_base, sanitize_payload(dn), model_key)
 
-        # pick direction with larger magnitude change
         d_up = p_up - base_prob
         d_dn = p_dn - base_prob
-        if abs(d_up) >= abs(d_dn):
-            signed = float(d_up)
-        else:
-            signed = float(d_dn)
+        signed = float(d_up) if abs(d_up) >= abs(d_dn) else float(d_dn)
         rows.append({"feature": f, "impact": abs(signed), "signed": signed})
 
     rows.sort(key=lambda r: r["impact"], reverse=True)
     return rows[:k]
 
 def explain_with_fallback(api_base: str, payload: Dict[str, Any], model_key: str) -> Tuple[List[Dict[str, float]], Dict[str, Any] | None, str]:
-    """
-    Try /explain first. If it fails (500/503), return local sensitivity top drivers.
-    Returns (top_rows, raw_exp_json_or_none, mode)
-    """
     try:
         exp = _api_post(f"{api_base}/explain", json_body=payload, params={"model": model_key}, timeout=60)
         top = exp.get("top") or []
-        # if server provided shap_values but no top, synthesize from shap_values
         if not top:
             shap_map = exp.get("shap_values", {}) or {}
             top = sorted(
@@ -361,20 +357,17 @@ def explain_with_fallback(api_base: str, payload: Dict[str, Any], model_key: str
             )[:8]
         if top:
             return top, exp, "server_shap"
-        # if still empty, fallback locally
         top_local = _sensitivity_top_drivers(api_base, payload, model_key, FEATURE_COLUMNS, k=8)
         return top_local, None, "local_sensitivity"
     except requests.HTTPError as e:
-        # Graceful fallback for explain_failed or 500s
         try:
             status = e.response.status_code
-            body = e.response.json() if e.response.headers.get("content-type","").startswith("application/json") else e.response.text
+            _ = e.response.json() if e.response.headers.get("content-type","").startswith("application/json") else e.response.text
         except Exception:
-            status, body = None, str(e)
+            status = None
         if status in (500, 503):
             top_local = _sensitivity_top_drivers(api_base, payload, model_key, FEATURE_COLUMNS, k=8)
             return top_local, None, "local_sensitivity"
-        # other HTTP errors: re-raise
         raise
     except Exception:
         top_local = _sensitivity_top_drivers(api_base, payload, model_key, FEATURE_COLUMNS, k=8)
@@ -568,7 +561,6 @@ with tab_single:
 
         with col1:
             age = st.number_input("Age (years)", 0, 120, age_d, key="sp_age")
-            # options [0,1]; index must be 0 or 1
             gender_index = 1 if int(gender_d) == 1 else 0
             gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_index, key="sp_gender")
             systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d, key="sp_sbp")
@@ -596,7 +588,6 @@ with tab_single:
             f"CKD stage={ckdstage}, Albuminuria category={albuminuriacat}"
         )
 
-        # Submit button MUST be inside form
         do_predict = st.form_submit_button("Predict with selected models", use_container_width=True, disabled=False, help="Runs the selected models")
 
     if do_predict:
@@ -642,7 +633,6 @@ with tab_single:
                     st.caption(str(e))
                 _log(f"Single predict ERROR ({m}): {e}")
 
-        # Explainability per selected model (with graceful fallback)
         st.markdown("#### Why did the model think that? (Top drivers)")
         st.caption("Higher bars = stronger influence on the decision for this case.")
         ecols = st.columns(len(selected_models))
@@ -671,7 +661,6 @@ with tab_single:
                         st.info("No features available for explanation.")
                     _log(f"Explain OK ({m}) via {mode}.")
                 except requests.HTTPError as e:
-                    # If server returns structured 'detail', present more nicely
                     try:
                         det = e.response.json()
                     except Exception:
@@ -998,9 +987,6 @@ Constraints:
 # =========================
 # Digital Twin (What-If) — uses /whatif
 # =========================
-# =========================
-# Digital Twin (What-If) — uses /whatif
-# =========================
 with tab_digital_twin:
     st.markdown("### Digital Twin — What-If Scenarios")
     st.markdown(
@@ -1021,11 +1007,9 @@ with tab_digital_twin:
         else:
             st.info("No single-check found. Upload a 1-row CSV baseline or paste JSON below.")
 
-        # allow CSV baseline
         csv_up = st.file_uploader("Optional: upload a 1-row CSV baseline", type=["csv"], key="dt_csv")
         base_csv = parse_csv_single_row(csv_up) if csv_up else None
 
-        # paste/edit JSON (auto-falls back to last single or CSV)
         raw_base_default = json.dumps(base_csv or base_from_single, indent=2) if (base_csv or base_from_single) else ""
         base_json = st.text_area(
             "Baseline (JSON, optional)",
@@ -1036,7 +1020,6 @@ with tab_digital_twin:
         use_base = sanitize_payload(safe_json_loads(base_json, fallback=(base_csv or base_from_single or {})))
 
     with cbase2:
-        # Downloadable template right here
         template_blank = pd.DataFrame(columns=FEATURE_COLUMNS)
         st.download_button(
             "Download baseline CSV template",
@@ -1088,20 +1071,25 @@ with tab_digital_twin:
 
     cA, cB = st.columns(2)
 
-    # ---- Single what-if action
+    # ---- Single what-if action (robust to backend shape)
     with cA:
         if st.button("Run single what-if", key="btn_dt_single"):
             body = {"base": use_base, "deltas": deltas, "model": model_key_sim}
             try:
                 out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=60)
-                # Expect: rows[0] includes prob_ckd, flag and threshold_used at root
-                row = (out.get("rows") or [{}])[0]
-                thr = float(out.get("threshold_used", 0.5))
-                prob = float(row.get("prob_ckd", 0.0))
-                flag = bool(row.get("flag", prob >= thr))
-                label, bg, col = _risk_badge(prob, thr)
 
-                # Card
+                # Backend may return separate rows & probs
+                row = (out.get("rows") or [{}])[0]
+                prob_from_block = None
+                try:
+                    prob_from_block = float((out.get("probs") or [{}])[0].get("prob_ckd"))
+                except Exception:
+                    pass
+                prob = float(row.get("prob_ckd", prob_from_block or 0.0))
+
+                thr = float(out.get("threshold_used", _get_threshold(st.session_state["api_url"], model_key_sim, 0.5)))
+                flag = _bool_flag(prob, thr)
+
                 st.markdown(
                     f"""
                     <div class="card">
@@ -1118,7 +1106,6 @@ with tab_digital_twin:
                     unsafe_allow_html=True
                 )
 
-                # Show only *changed* inputs for readability
                 changed = []
                 for k, dv in (deltas or {}).items():
                     if float(dv) != 0.0:
@@ -1138,7 +1125,7 @@ with tab_digital_twin:
             except Exception as e:
                 st.error(f"What-if error: {e}")
 
-    # ---- Grid sweep action
+    # ---- Grid sweep action (merge probs → rows, compute flags)
     with cB:
         if st.button("Run grid sweep", key="btn_dt_grid"):
             if not grid:
@@ -1147,22 +1134,33 @@ with tab_digital_twin:
                 body = {"base": use_base, "grid": grid, "model": model_key_sim}
                 try:
                     out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=120)
-                    thr = float(out.get("threshold_used", 0.5))
                     rows = out.get("rows", []) or []
+                    probs = out.get("probs", []) or []
+                    thr = float(out.get("threshold_used", _get_threshold(st.session_state["api_url"], model_key_sim, 0.5)))
+                    swept_features = out.get("swept_features") or out.get("features") or list(grid.keys())
+
                     if not rows:
                         st.info("No rows returned.")
                     else:
-                        df = pd.DataFrame(rows)
-                        # Keep a compact view: swept features + prob + flag
-                        cols = (out.get("swept_features") or []) + ["prob_ckd", "flag"]
+                        df_rows = pd.DataFrame(rows)
+                        df_probs = pd.DataFrame(probs) if probs else pd.DataFrame([{}] * len(df_rows))
+                        if len(df_probs) != len(df_rows):
+                            df_probs = df_probs.reindex(range(len(df_rows))).fillna(method="ffill").fillna(method="bfill")
+                        df = pd.concat([df_rows.reset_index(drop=True), df_probs.reset_index(drop=True)], axis=1)
+
+                        if "prob_ckd" not in df.columns:
+                            st.warning("Backend did not return per-row probabilities; showing raw inputs only.")
+                            df["prob_ckd"] = float("nan")
+                        df["flag"] = df["prob_ckd"].apply(lambda p: _bool_flag(p, thr))
+
+                        cols = [*swept_features, "prob_ckd", "flag"]
                         cols = [c for c in cols if c in df.columns]
                         view = df[cols].copy()
 
-                        # Summary up top
                         n = len(view)
                         n_flag = int(view["flag"].sum()) if "flag" in view else 0
-                        best = float(view["prob_ckd"].min()) if "prob_ckd" in view else None
-                        worst = float(view["prob_ckd"].max()) if "prob_ckd" in view else None
+                        best = float(view["prob_ckd"].min()) if view["prob_ckd"].notna().any() else float("nan")
+                        worst = float(view["prob_ckd"].max()) if view["prob_ckd"].notna().any() else float("nan")
                         st.markdown(
                             f"**{n} combinations** • **{n_flag} flagged ≥ {thr:.2f}** • "
                             f"min prob {best:.3f} • max prob {worst:.3f}"
@@ -1170,23 +1168,27 @@ with tab_digital_twin:
 
                         st.dataframe(view, use_container_width=True)
 
-                        # Simple chart:
-                        if len((out.get("swept_features") or [])) == 1:
-                            f = out["swept_features"][0]
-                            fig = px.line(view.sort_values(f), x=f, y="prob_ckd", markers=True,
-                                          title=f"Risk vs {pretty_feature_name(f)} (thr {thr:.2f})")
-                            st.plotly_chart(fig, use_container_width=True)
-                        elif len((out.get("swept_features") or [])) == 2:
-                            f1, f2 = out["swept_features"]
-                            pivot = view.pivot_table(index=f1, columns=f2, values="prob_ckd", aggfunc="mean")
-                            fig = px.imshow(pivot, aspect="auto",
-                                            labels=dict(color="Prob CKD"),
-                                            title=f"Risk heatmap ({pretty_feature_name(f1)} × {pretty_feature_name(f2)})")
-                            st.plotly_chart(fig, use_container_width=True)
+                        if len(swept_features) == 1 and "prob_ckd" in view.columns:
+                            f = swept_features[0]
+                            try:
+                                fig = px.line(view.sort_values(f), x=f, y="prob_ckd", markers=True,
+                                              title=f"Risk vs {pretty_feature_name(f)} (thr {thr:.2f})")
+                                st.plotly_chart(fig, use_container_width=True)
+                            except Exception:
+                                pass
+                        elif len(swept_features) == 2 and "prob_ckd" in view.columns:
+                            f1, f2 = swept_features
+                            try:
+                                pivot = view.pivot_table(index=f1, columns=f2, values="prob_ckd", aggfunc="mean")
+                                fig = px.imshow(pivot, aspect="auto",
+                                                labels=dict(color="Prob CKD"),
+                                                title=f"Risk heatmap ({pretty_feature_name(f1)} × {pretty_feature_name(f2)})")
+                                st.plotly_chart(fig, use_container_width=True)
+                            except Exception:
+                                pass
                         else:
                             st.caption("Tip: choose 1 feature for a line chart, 2 for a heatmap. More features still show in the table.")
 
-                        # Download
                         st.download_button(
                             "Download grid results (CSV)",
                             data=view.to_csv(index=False).encode("utf-8"),
@@ -1204,13 +1206,6 @@ with tab_digital_twin:
                 except Exception as e:
                     st.error(f"Grid what-if error: {e}")
 
-
-# =========================
-# Counterfactuals — uses /counterfactual
-# =========================
-# =========================
-# Counterfactuals — uses /counterfactual
-# =========================
 # =========================
 # Counterfactuals — uses /counterfactual
 # =========================
@@ -1218,7 +1213,6 @@ with tab_counterfactuals:
     st.markdown("### Counterfactuals — Actionable tweaks to get below a target")
     st.caption("We’ll propose small, realistic changes (BP, A1c, ACR, etc.) that move risk below your chosen target.")
 
-    # --- Baseline: last single OR 1-row CSV OR pasted JSON
     last_base = st.session_state.get("last_pred_payload") or {}
     c1, c2 = st.columns([2,1])
     with c1:
@@ -1262,7 +1256,6 @@ with tab_counterfactuals:
         st.warning("Provide a baseline using last single, CSV, or JSON above.")
         st.stop()
 
-    # --- Controls
     col1, col2, col3 = st.columns([1,1,1])
     with col1:
         target_prob = st.number_input("Target probability (≤)", 0.0, 1.0, 0.20, step=0.01, key="cf_target_prob")
@@ -1277,14 +1270,11 @@ with tab_counterfactuals:
         try:
             out = _api_post(f"{st.session_state['api_url']}/counterfactual", json_body=body, timeout=120)
 
-            # Expect a normalized shape (see backend patch):
-            # { threshold_used, initial_prob, final_prob, target_prob, final_flag, steps[], final_candidate{} }
             thr = float(out.get("threshold_used", 0.5))
             p0  = float(out.get("initial_prob", 0.0))
             pf  = float(out.get("final_prob", 0.0))
             flag = bool(out.get("final_flag", pf >= thr))
 
-            # Top card
             st.markdown(
                 f"""
                 <div class="card">
@@ -1303,7 +1293,6 @@ with tab_counterfactuals:
                 unsafe_allow_html=True
             )
 
-            # Steps table (user-friendly labels + improvements)
             steps = out.get("steps", []) or []
             if steps:
                 df_steps = pd.DataFrame(steps)
@@ -1312,13 +1301,11 @@ with tab_counterfactuals:
                 st.markdown("**Change path**")
                 st.table(df_steps)
 
-                # Summarize total change per feature
                 grp = df_steps.groupby("feature", dropna=False)["delta"].sum().reset_index()
                 grp["delta"] = grp["delta"].map(lambda x: f"{x:+.3f}")
                 st.markdown("**Summary of adjustments**")
                 st.table(grp)
 
-            # Final candidate — show only the important finals
             final_cand = out.get("final_candidate") or out.get("result") or out.get("best", {}).get("candidate")
             if isinstance(final_cand, dict):
                 nice_keys = ["systolicbp","diastolicbp","gfr","acr","serumelectrolytespotassium","hba1c","hemoglobinlevels"]
@@ -1337,8 +1324,6 @@ with tab_counterfactuals:
                 st.code(msg, language="json")
         except Exception as e:
             st.error(f"Counterfactual error: {e}")
-
-
 
 # =========================
 # Similar Patients — uses /similar
@@ -1363,7 +1348,6 @@ with tab_similarity:
             cohort = []
             if cohort_file:
                 dfc = pd.read_csv(cohort_file)
-                # keep only expected columns; fill missing
                 for c in FEATURE_COLUMNS:
                     if c not in dfc.columns:
                         dfc[c] = 0.0
@@ -1402,7 +1386,6 @@ with tab_agents:
         chosen_key = next((k for k in avail if MODEL_KEYS.get(k, k) == chosen), avail[0])
         res = results[chosen_key]
 
-        # Build summary for API agents — keep it compact
         summary = {
             "model": chosen_key,
             "prob_ckd": float(res.get("prob_ckd", 0.0)),
@@ -1429,7 +1412,6 @@ with tab_agents:
             try:
                 out = _api_post(f"{st.session_state['api_url']}/agents/plan", json_body=summary, timeout=120)
                 st.success("Care plan generated.")
-                # Try to render common structure: {sections: [{title, bullets/text}...]}
                 if isinstance(out, dict) and out.get("sections"):
                     for sec in out["sections"]:
                         st.markdown(f"**{sec.get('title','Section')}**")
