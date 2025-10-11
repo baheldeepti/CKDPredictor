@@ -1616,28 +1616,4 @@ with tab_batch:
                             merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
                             merged_list.append(merged.assign(model_used=m))
                             st.download_button(
-                                f"Download results • {MODEL_KEYS.get(m,m)}",
-                                data=merged.to_csv(index=False).encode("utf-8"),
-                                file_name=f"ckd_batch_predictions_{m}.csv",
-                                mime="text/csv",
-                                key=f"dl_model_{m}"
-                            )
-                        if merged_list:
-                            all_merged = pd.concat(merged_list, axis=0, ignore_index=True)
-                            st.download_button(
-                                "Download ALL results (combined)",
-                                data=all_merged.to_csv(index=False).encode("utf-8"),
-                                file_name="ckd_batch_predictions_all_models.csv",
-                                mime="text/csv",
-                                key="dl_all_models"
-                            )
-
-                        if retrain_after_batch:
-                            try:
-                                rr = requests.post(f"{st.session_state['api_url']}/admin/retrain", timeout=10)
-                                if rr.status_code in (200, 202):
-                                    st.success("Training started. Check API health above.")
-                     except Exception as e:
-                                st.error(f"Failed to start training: {e}")
-                                _log(f"Batch retrain ERROR: {e}")
-
+                                f"Downloa
