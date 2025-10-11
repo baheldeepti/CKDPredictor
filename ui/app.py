@@ -1616,4 +1616,4 @@ with tab_batch:
                             merged = pd.concat([df.reset_index(drop=True), preds.reset_index(drop=True)], axis=1)
                             merged_list.append(merged.assign(model_used=m))
                             st.download_button(
-                                f"Downloa
+                                f"Download the results"
