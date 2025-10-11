@@ -552,7 +552,10 @@ Return short, structured answers with headings when useful.
         ctx_lines.append("NO_CONTEXT_AVAILABLE")
     ctx_lines.append("CONTEXT END")
 
-    user_prompt = f"{'\n'.join(ctx_lines)}\n\nUSER QUESTION:\n{user_msg}".strip()
+
+    ctx_text = "\n".join(ctx_lines
+    user_prompt = f"{ctx_text}\n\nUSER QUESTION:\n{user_msg}".strip()
+   
     return system_prompt, user_prompt
 
 with tab_chat:
