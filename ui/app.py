@@ -1569,7 +1569,8 @@ with tab_batch:
             st.error(f"Missing columns: {missing}")
         else:
             st.dataframe(df.head())
-
+            
+            
             if st.button("Run batch with selected models", key="btn_run_batch"):
                 st.session_state["batch_preds"] = {}
                 summary_rows = []
@@ -1625,3 +1626,5 @@ with tab_batch:
                         )
     except Exception as e:
         st.error(f"Error processing CSV file: {e}")
+
+
