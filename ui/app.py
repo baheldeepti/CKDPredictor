@@ -5,6 +5,7 @@ import math
 import requests
 import streamlit as st
 import pandas as pd
+import plotly.express as px  # NEW
 from typing import Dict, Any, List, Tuple
 
 # =========================
@@ -250,6 +251,34 @@ def sample_records_df():
         [58, 1, 170, 110, 4.6, 60, 28, 750, 135, 6.2, 10.8, 8.3, 60, 13.0, 4, 3, 1, 1, 1],
     ]
     return pd.DataFrame(rows, columns=FEATURE_COLUMNS)
+GRID_SWEEP_HELP = """
+**What is a grid sweep?** Pick one or more knobs (e.g., SBP, GFR, ACR), give each a list of target values,
+and we simulate **every combination** to see how the risk changes. It’s like trying out all “what-if”
+settings at once to spot safe ranges and red flags.
+"""
+
+def parse_csv_single_row(upload) -> dict | None:
+    try:
+        df = pd.read_csv(upload)
+        if df.empty:
+            return None
+        # keep only known features; fill missing with 0
+        for c in FEATURE_COLUMNS:
+            if c not in df.columns:
+                df[c] = 0.0
+        row = df[FEATURE_COLUMNS].iloc[0].to_dict()
+        return sanitize_payload(row)
+    except Exception:
+        return None
+
+def pretty_feature_name(f: str) -> str:
+    mapping = {
+        "systolicbp":"Systolic BP", "diastolicbp":"Diastolic BP",
+        "gfr":"GFR", "acr":"ACR", "serumelectrolytespotassium":"Potassium",
+        "hba1c":"HbA1c"
+    }
+    return mapping.get(f, f)
+
 
 # =========================
 # Local fallback explainer
@@ -961,21 +990,66 @@ Constraints:
 # =========================
 # Digital Twin (What-If) — uses /whatif
 # =========================
+# =========================
+# Digital Twin (What-If) — uses /whatif
+# =========================
 with tab_digital_twin:
-    st.markdown("Run **what-if** scenarios on the last single case or custom values. Either apply small deltas or a grid sweep.")
-    base = st.session_state.get("last_pred_payload") or {}
-    if not base:
-        st.info("Run a single prediction first to set a baseline, or paste JSON below.")
-    base_json = st.text_area(
-        "Baseline JSON (optional, overrides last single payload if provided)",
-        value=json.dumps(base, indent=2),
-        key="dt_baseline_json"
+    st.markdown("### Digital Twin — What-If Scenarios")
+    st.markdown(
+        "Try **small nudges** (change one or two numbers) or run a **grid sweep** (try a list of values per knob). "
+        "Designed for patients and lab assistants: clear flags, simple summaries, and charts."
     )
-    use_base = sanitize_payload(safe_json_loads(base_json, fallback=base or {}))
+    with st.expander("What is a grid sweep?", expanded=False):
+        st.markdown(GRID_SWEEP_HELP)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("**Simple deltas** (applied to baseline)")
+    # ---- Baseline selection: last single OR CSV upload
+    base_from_single = st.session_state.get("last_pred_payload") or {}
+    st.markdown("#### Baseline")
+    cbase1, cbase2 = st.columns([2,1])
+
+    with cbase1:
+        if base_from_single:
+            st.success("Using the last single-check as baseline. You can override below.")
+        else:
+            st.info("No single-check found. Upload a 1-row CSV baseline or paste JSON below.")
+
+        # allow CSV baseline
+        csv_up = st.file_uploader("Optional: upload a 1-row CSV baseline", type=["csv"], key="dt_csv")
+        base_csv = parse_csv_single_row(csv_up) if csv_up else None
+
+        # paste/edit JSON (auto-falls back to last single or CSV)
+        raw_base_default = json.dumps(base_csv or base_from_single, indent=2) if (base_csv or base_from_single) else ""
+        base_json = st.text_area(
+            "Baseline (JSON, optional)",
+            value=raw_base_default,
+            placeholder="Paste baseline JSON or leave empty if using last single / CSV…",
+            key="dt_baseline_json"
+        )
+        use_base = sanitize_payload(safe_json_loads(base_json, fallback=(base_csv or base_from_single or {})))
+
+    with cbase2:
+        # Downloadable template right here
+        template_blank = pd.DataFrame(columns=FEATURE_COLUMNS)
+        st.download_button(
+            "Download baseline CSV template",
+            data=template_blank.to_csv(index=False).encode("utf-8"),
+            file_name="ckd_baseline_template.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dt_dl_baseline_template"
+        )
+
+    if not use_base:
+        st.warning("Provide a baseline using the last single prediction, a 1-row CSV, or paste JSON above.")
+        st.stop()
+
+    # ---- Deltas vs Grid configuration
+    st.divider()
+    st.markdown("#### Choose a simulation mode")
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Quick nudges** (applied to baseline)")
         d_sbp = st.number_input("Δ Systolic BP (mmHg)", -40, 40, 0, key="dt_d_sbp")
         d_dbp = st.number_input("Δ Diastolic BP (mmHg)", -30, 30, 0, key="dt_d_dbp")
         d_gfr = st.number_input("Δ GFR (mL/min/1.73m²)", -50, 50, 0, key="dt_d_gfr")
@@ -983,26 +1057,21 @@ with tab_digital_twin:
         d_k   = st.number_input("Δ Potassium (mEq/L)", -2.0, 2.0, 0.0, step=0.1, key="dt_d_k")
         d_a1c = st.number_input("Δ HbA1c (%)", -3.0, 3.0, 0.0, step=0.1, key="dt_d_a1c")
         deltas = {
-            "systolicbp": d_sbp,
-            "diastolicbp": d_dbp,
-            "gfr": d_gfr,
-            "acr": d_acr,
-            "serumelectrolytespotassium": d_k,
-            "hba1c": d_a1c,
+            "systolicbp": d_sbp, "diastolicbp": d_dbp, "gfr": d_gfr, "acr": d_acr,
+            "serumelectrolytespotassium": d_k, "hba1c": d_a1c,
         }
-    with c2:
-        st.markdown("**Grid sweep** (comma-separated values)")
+
+    with right:
+        st.markdown("**Grid sweep** (try lists of target values)")
+        st.caption("We’ll simulate every combination you provide below.")
         grid_sbp = st.text_input("SBP list", "120,130,140", key="dt_grid_sbp")
         grid_gfr = st.text_input("GFR list", "30,45,60,75,90", key="dt_grid_gfr")
         grid_acr = st.text_input("ACR list", "10,30,300", key="dt_grid_acr")
         grid = {}
         try:
-            if grid_sbp.strip():
-                grid["systolicbp"] = [float(x) for x in grid_sbp.split(",") if x.strip()]
-            if grid_gfr.strip():
-                grid["gfr"] = [float(x) for x in grid_gfr.split(",") if x.strip()]
-            if grid_acr.strip():
-                grid["acr"] = [float(x) for x in grid_acr.split(",") if x.strip()]
+            if grid_sbp.strip(): grid["systolicbp"] = [float(x) for x in grid_sbp.split(",") if x.strip()]
+            if grid_gfr.strip(): grid["gfr"] = [float(x) for x in grid_gfr.split(",") if x.strip()]
+            if grid_acr.strip(): grid["acr"] = [float(x) for x in grid_acr.split(",") if x.strip()]
         except Exception as e:
             st.error(f"Grid parse error: {e}")
 
@@ -1010,42 +1079,123 @@ with tab_digital_twin:
     model_key_sim = MODEL_LABELS.get(model_for_sim, "rf")
 
     cA, cB = st.columns(2)
+
+    # ---- Single what-if action
     with cA:
         if st.button("Run single what-if", key="btn_dt_single"):
-            body = {"base": use_base or base, "deltas": deltas, "model": model_key_sim}
+            body = {"base": use_base, "deltas": deltas, "model": model_key_sim}
             try:
                 out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=60)
-                st.success("Done.")
-                st.json(out)
+                # Expect: rows[0] includes prob_ckd, flag and threshold_used at root
+                row = (out.get("rows") or [{}])[0]
+                thr = float(out.get("threshold_used", 0.5))
+                prob = float(row.get("prob_ckd", 0.0))
+                flag = bool(row.get("flag", prob >= thr))
+                label, bg, col = _risk_badge(prob, thr)
+
+                # Card
+                st.markdown(
+                    f"""
+                    <div class="card">
+                      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                        <div style="font-size:18px;font-weight:700;">{MODEL_KEYS.get(model_key_sim, model_key_sim)}</div>
+                        <div class="badge" style="background:{'#fee2e2' if flag else '#dcfce7'};color:{'#991b1b' if flag else '#065f46'}">{'Flagged' if flag else 'Not flagged'}</div>
+                      </div>
+                      <div style="display:flex;gap:24px;flex-wrap:wrap;">
+                        <div><strong>Probability</strong><br><span style="font-size:20px;">{prob:.3f}</span></div>
+                        <div><strong>Decision threshold</strong><br><span style="font-size:20px;">{thr:.3f}</span></div>
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
+                )
+
+                # Show only *changed* inputs for readability
+                changed = []
+                for k, dv in (deltas or {}).items():
+                    if float(dv) != 0.0:
+                        changed.append(f"- **{pretty_feature_name(k)}** {'+' if dv>=0 else ''}{dv}")
+                if changed:
+                    st.markdown("**Changes applied**")
+                    st.markdown("\n".join(changed))
+                else:
+                    st.caption("No deltas applied; baseline only.")
             except requests.HTTPError as e:
-                # Friendly message when backend module is missing
                 msg = getattr(e.response, "text", str(e)) or str(e)
-                if "simulate_whatif not available" in msg or e.response.status_code == 503:
-                    st.info("What-if is currently disabled on the server. Add `api/digital_twin.py` and restart the API.")
+                if "simulate_whatif not available" in msg or getattr(e.response, "status_code", 0) == 503:
+                    st.info("What-if is disabled on the server. Add `api/digital_twin.py` and restart the API.")
                 else:
                     st.error("What-if failed")
                     st.code(msg, language="json")
             except Exception as e:
                 st.error(f"What-if error: {e}")
+
+    # ---- Grid sweep action
     with cB:
         if st.button("Run grid sweep", key="btn_dt_grid"):
-            body = {"base": use_base or base, "grid": grid, "model": model_key_sim}
-            try:
-                out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=120)
-                st.success("Done.")
-                if isinstance(out, dict) and "rows" in out:
-                    st.dataframe(pd.DataFrame(out["rows"]))
-                else:
-                    st.json(out)
-            except requests.HTTPError as e:
-                msg = getattr(e.response, "text", str(e)) or str(e)
-                if "simulate_whatif not available" in msg or e.response.status_code == 503:
-                    st.info("Grid what-if is disabled on the server. Add `api/digital_twin.py` and restart the API.")
-                else:
-                    st.error("Grid what-if failed")
-                    st.code(msg, language="json")
-            except Exception as e:
-                st.error(f"Grid what-if error: {e}")
+            if not grid:
+                st.warning("Enter at least one list (e.g., SBP or GFR) for a grid sweep.")
+            else:
+                body = {"base": use_base, "grid": grid, "model": model_key_sim}
+                try:
+                    out = _api_post(f"{st.session_state['api_url']}/whatif", json_body=body, timeout=120)
+                    thr = float(out.get("threshold_used", 0.5))
+                    rows = out.get("rows", []) or []
+                    if not rows:
+                        st.info("No rows returned.")
+                    else:
+                        df = pd.DataFrame(rows)
+                        # Keep a compact view: swept features + prob + flag
+                        cols = (out.get("swept_features") or []) + ["prob_ckd", "flag"]
+                        cols = [c for c in cols if c in df.columns]
+                        view = df[cols].copy()
+
+                        # Summary up top
+                        n = len(view)
+                        n_flag = int(view["flag"].sum()) if "flag" in view else 0
+                        best = float(view["prob_ckd"].min()) if "prob_ckd" in view else None
+                        worst = float(view["prob_ckd"].max()) if "prob_ckd" in view else None
+                        st.markdown(
+                            f"**{n} combinations** • **{n_flag} flagged ≥ {thr:.2f}** • "
+                            f"min prob {best:.3f} • max prob {worst:.3f}"
+                        )
+
+                        st.dataframe(view, use_container_width=True)
+
+                        # Simple chart:
+                        if len((out.get("swept_features") or [])) == 1:
+                            f = out["swept_features"][0]
+                            fig = px.line(view.sort_values(f), x=f, y="prob_ckd", markers=True,
+                                          title=f"Risk vs {pretty_feature_name(f)} (thr {thr:.2f})")
+                            st.plotly_chart(fig, use_container_width=True)
+                        elif len((out.get("swept_features") or [])) == 2:
+                            f1, f2 = out["swept_features"]
+                            pivot = view.pivot_table(index=f1, columns=f2, values="prob_ckd", aggfunc="mean")
+                            fig = px.imshow(pivot, aspect="auto",
+                                            labels=dict(color="Prob CKD"),
+                                            title=f"Risk heatmap ({pretty_feature_name(f1)} × {pretty_feature_name(f2)})")
+                            st.plotly_chart(fig, use_container_width=True)
+                        else:
+                            st.caption("Tip: choose 1 feature for a line chart, 2 for a heatmap. More features still show in the table.")
+
+                        # Download
+                        st.download_button(
+                            "Download grid results (CSV)",
+                            data=view.to_csv(index=False).encode("utf-8"),
+                            file_name="ckd_grid_sweep_results.csv",
+                            mime="text/csv",
+                            key="dl_grid_results"
+                        )
+                except requests.HTTPError as e:
+                    msg = getattr(e.response, "text", str(e)) or str(e)
+                    if "simulate_whatif not available" in msg or getattr(e.response, "status_code", 0) == 503:
+                        st.info("Grid what-if is disabled on the server. Add `api/digital_twin.py` and restart the API.")
+                    else:
+                        st.error("Grid what-if failed")
+                        st.code(msg, language="json")
+                except Exception as e:
+                    st.error(f"Grid what-if error: {e}")
+
 
 # =========================
 # Counterfactuals — uses /counterfactual
