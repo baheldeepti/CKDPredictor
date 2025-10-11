@@ -553,7 +553,7 @@ Return short, structured answers with headings when useful.
     ctx_lines.append("CONTEXT END")
 
 
-    ctx_text = "\n".join(ctx_lines
+    ctx_text = "\n".join(ctx_lines)
     user_prompt = f"{ctx_text}\n\nUSER QUESTION:\n{user_msg}".strip()
    
     return system_prompt, user_prompt
