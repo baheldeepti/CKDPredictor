@@ -784,7 +784,6 @@ st.divider()
 # Tabs (Chat added first)
 # =========================
 (
-    tab_chat,
     tab_single,
     tab_batch,
     tab_metrics,
@@ -792,10 +791,10 @@ st.divider()
     tab_digital_twin,
     tab_counterfactuals,
     tab_similarity,
-    tab_agents
+    tab_agents,
+    tab_chat,
 ) = st.tabs(
     [
-        "Chat (Assistant)",
         "Single check (compare models)",
         "Bulk check (CSV)",
         "Service & logs",
@@ -803,7 +802,9 @@ st.divider()
         "Digital Twin (What-If)",
         "Counterfactuals",
         "Similar Patients",
-        "Care Plan (Agents)"
+        "Care Plan"
+        "Chat Assistant",
+        
     ]
 )
 
@@ -1097,10 +1098,14 @@ with tab_single:
                         if "impact" not in df_top.columns and "signed" in df_top.columns:
                             df_top["impact"] = df_top["signed"].abs()
                         df_sorted = df_top.sort_values("impact", ascending=False)
+                        # lock the display order + plot in descending order
+                        df_sorted["feature"] = pd.Categorical(df_sorted["feature"], categories=df_sorted["feature"].tolist(), ordered=True)
+                        st.bar_chart(df_sorted.set_index("feature")["impact"])
                         st.bar_chart(df_top.set_index("feature")["impact"])
                         bullets = "\n".join(
                             f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (Δprob={float(row.get('signed',0)):+.3f})"
-                            for row in top[:5]
+                            
+                            for _, row in df_sorted.head(5).iterrows()
                         )
                         st.markdown(bullets)
                         note = "Server SHAP" if mode == "server_shap" else "Local sensitivity fallback"
