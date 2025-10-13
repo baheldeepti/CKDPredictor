@@ -1097,17 +1097,37 @@ with tab_single:
                         df_top = pd.DataFrame(top)
                         if "impact" not in df_top.columns and "signed" in df_top.columns:
                             df_top["impact"] = df_top["signed"].abs()
+                        # Ensure numeric + sort descending
+                        df_top["impact"] = pd.to_numeric(df_top["impact"], errors="coerce").fillna(0.0)
                         df_sorted = df_top.sort_values("impact", ascending=False)
-                        # lock the display order + plot in descending order
-                        df_sorted["feature"] = pd.Categorical(df_sorted["feature"], categories=df_sorted["feature"].tolist(), ordered=True)
                         
-                        st.bar_chart(df_top.set_index("feature")["impact"])
+                        # Plot with Plotly: lock category order (descending)
+                        fig = px.bar(
+                            df_sorted,
+                            y="feature",            # horizontal bars (readable labels)
+                            x="impact",
+                            orientation="h",
+                            title=None
+                        )
+                        fig.update_layout(
+                            yaxis=dict(
+                                categoryorder="array",
+                                categoryarray=df_sorted["feature"].tolist()  # exact order we computed
+                            ),
+                            xaxis_title="Impact (|Δprob|)",
+                            yaxis_title="Feature",
+                            margin=dict(l=10, r=10, t=10, b=10),
+                            height=320
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Bullets (top 5 in sorted order)
                         bullets = "\n".join(
                             f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (Δprob={float(row.get('signed',0)):+.3f})"
-                            
                             for _, row in df_sorted.head(5).iterrows()
                         )
                         st.markdown(bullets)
+
                         note = "Server SHAP" if mode == "server_shap" else "Local sensitivity fallback"
                         st.caption(f"*Explainer: {note}*")
 
