@@ -1123,7 +1123,7 @@ with tab_single:
                             xaxis_title="Impact (|Δprob|)",
                             yaxis_title="Feature",
                             margin=dict(l=10, r=40, t=10, b=10),  # a little extra right margin for labels
-                            height=320
+                            height=320,
                             xaxis_range=[0, float(df_sorted["impact"].max()) * 1.15]  # <-- ADD: headroom for labels
                         )
                         st.plotly_chart(fig, use_container_width=True)
