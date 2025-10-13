@@ -1096,6 +1096,7 @@ with tab_single:
                         df_top = pd.DataFrame(top)
                         if "impact" not in df_top.columns and "signed" in df_top.columns:
                             df_top["impact"] = df_top["signed"].abs()
+                        df_sorted = df_top.sort_values("impact", ascending=False)
                         st.bar_chart(df_top.set_index("feature")["impact"])
                         bullets = "\n".join(
                             f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (Δprob={float(row.get('signed',0)):+.3f})"
