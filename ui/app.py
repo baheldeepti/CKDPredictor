@@ -68,7 +68,7 @@ LLM_MODEL    = st.secrets.get("LLM_MODEL", "openrouter/auto")
 
 APP_REPO_URL = "https://github.com/baheldeepti/CKDPredictor"
 
-st.set_page_config(page_title=APP_TITLE_HUMAN, page_icon="🧭", layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="🧭", layout="wide")
 
 
 # -------------------------
