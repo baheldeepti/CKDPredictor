@@ -1106,7 +1106,8 @@ with tab_single:
                             df_sorted,
                             y="feature",            # horizontal bars (readable labels)
                             x="impact",
-                            orientation="h",
+                            orientation="v",
+                            text="impact",          # <-- ADD: use impact values as labels
                             title=None
                         )
                         fig.update_layout(
