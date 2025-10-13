@@ -319,8 +319,8 @@ pre, code {
   white-space: pre-wrap;
   font-family: var(--font-mono);
   font-size: .86rem;
-  background: #0b2942;
-  color: #e6edf3;
+  background: var(--bg-2);
+  color: var(--fg-800);
   border-radius: var(--r-sm);
   padding: .5rem .6rem;
   border: 1px solid rgba(255,255,255,.06);
@@ -712,7 +712,7 @@ with st.sidebar:
 # =========================
 # Header + Controls
 # =========================
-st.title(f"🩺 {APP_TITLE}")
+st.title(f"🧭 {APP_TITLE}")
 st.caption("Quick, transparent CKD risk checks—single or CSV—plus explainers, logs, AI summaries, and a scoped Chat Assistant.")
 
 top_left, top_right = st.columns([3, 2])
