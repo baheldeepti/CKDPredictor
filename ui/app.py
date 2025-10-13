@@ -712,7 +712,7 @@ with st.sidebar:
 # =========================
 # Header + Controls
 # =========================
-st.title(f"🩺 {APP_TITLE_HUMAN}")
+st.title(f"🩺 {APP_TITLE}")
 st.caption("Quick, transparent CKD risk checks—single or CSV—plus explainers, logs, AI summaries, and a scoped Chat Assistant.")
 
 top_left, top_right = st.columns([3, 2])
