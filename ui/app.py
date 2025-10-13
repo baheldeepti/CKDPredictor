@@ -1106,9 +1106,14 @@ with tab_single:
                             df_sorted,
                             y="feature",            # horizontal bars (readable labels)
                             x="impact",
-                            orientation="v",
+                            orientation="h",
                             text="impact",          # <-- ADD: use impact values as labels
                             title=None
+                        )
+                        fig.update_traces(
+                            texttemplate="%{text:.3f}",   # <-- ADD: format labels
+                            textposition="outside",       # <-- ADD: place labels at end of bars
+                            cliponaxis=False              # <-- ADD: prevent clipping of labels
                         )
                         fig.update_layout(
                             yaxis=dict(
@@ -1117,8 +1122,9 @@ with tab_single:
                             ),
                             xaxis_title="Impact (|Δprob|)",
                             yaxis_title="Feature",
-                            margin=dict(l=10, r=10, t=10, b=10),
+                            margin=dict(l=10, r=40, t=10, b=10),  # a little extra right margin for labels
                             height=320
+                            xaxis_range=[0, float(df_sorted["impact"].max()) * 1.15]  # <-- ADD: headroom for labels
                         )
                         st.plotly_chart(fig, use_container_width=True)
                         
