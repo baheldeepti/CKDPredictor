@@ -802,7 +802,7 @@ st.divider()
         "Digital Twin (What-If)",
         "Counterfactuals",
         "Similar Patients",
-        "Care Plan"
+        "Care Plan",
         "Chat Assistant",
         
     ]
@@ -1100,7 +1100,7 @@ with tab_single:
                         df_sorted = df_top.sort_values("impact", ascending=False)
                         # lock the display order + plot in descending order
                         df_sorted["feature"] = pd.Categorical(df_sorted["feature"], categories=df_sorted["feature"].tolist(), ordered=True)
-                        st.bar_chart(df_sorted.set_index("feature")["impact"])
+                        
                         st.bar_chart(df_top.set_index("feature")["impact"])
                         bullets = "\n".join(
                             f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (Δprob={float(row.get('signed',0)):+.3f})"
