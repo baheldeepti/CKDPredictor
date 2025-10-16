@@ -409,6 +409,16 @@ def nl2br(s: str) -> str:
         return s.replace("\n", "<br/>")
     except Exception:
         return s
+def _http_ascii(s: str) -> str:
+    """
+    Return a version safe for HTTP headers (ISO-8859-1). 
+    Drops characters that can't be encoded as ASCII.
+    """
+    try:
+        return str(s).encode("ascii", "ignore").decode("ascii")
+    except Exception:
+        return ""
+
 
 def _cf_feature_nice(f: str) -> str:
     names = {
@@ -469,8 +479,8 @@ def _call_openrouter_chat(system_prompt: str, user_prompt: str) -> str | None:
     url = (LLM_BASE_URL.rstrip("/") + "/chat/completions") if LLM_BASE_URL else "https://openrouter.ai/api/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {LLM_API_KEY}",
-        "HTTP-Referer": APP_URL,
-        "X-Title": APP_TITLE,
+        "HTTP-Referer": _http_ascii(APP_URL),   # usually ASCII already; safe-guard anyway
+        "X-Title": _http_ascii(APP_TITLE),      # strip em dash and friends
         "Content-Type": "application/json",
     }
     payload = {
