@@ -34,6 +34,8 @@ APP_PRODUCT_NAME = "NephroCompass"
 APP_TAGLINE      = "Kidney Health Radar"
 APP_TITLE        = "NephroCompass — Kidney Health Radar"
 APP_REPO_URL    = "https://github.com/baheldeepti/CKDPredictor"
+# Prefer a user-specified public URL (for OpenRouter’s Referer requirement); fallback to the repo URL.
+APP_URL = st.secrets.get("APP_URL", APP_REPO_URL)
 
 # Prefer hosted API on Render; allow override via Secrets or env.
 API_URL_DEFAULT = "https://ckdpredictor.onrender.com"
