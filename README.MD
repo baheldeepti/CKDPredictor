@@ -5,3 +5,7 @@
 2) `pip install -r requirements.txt`
 3) `cp config/.env.example .env`
 4) `make prep`  (runs ETL: validate + derive features + write parquet)
+
+This project is proudly supported by Neon
+https://console.neon.tech/app/org-twilight-dream-72459901/projects
+
