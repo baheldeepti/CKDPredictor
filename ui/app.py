@@ -962,13 +962,7 @@ with tab_chat:
     else:
         st.caption("No context loaded yet.")
 # =========================
-# Single prediction (PATIENT-FRIENDLY)
-# =========================
-# =========================
-# Single prediction (PATIENT-FIRST, MULTI-MODEL)
-# =========================
-# =========================
-# Single prediction (PATIENT-FIRST, MULTI-MODEL)
+# Single prediction (PATIENT-FIRST, MULTI-MODEL, SAFE)
 # =========================
 with tab_single:
 
@@ -987,7 +981,7 @@ with tab_single:
     )
 
     # -------------------------
-    # Visible explanations (NO tooltips)
+    # Visible explanations
     # -------------------------
     def explain(label, text):
         st.markdown(f"**{label}**")
@@ -1000,54 +994,46 @@ with tab_single:
             explain("Age", "Kidney function naturally changes as we age.")
             age = st.number_input("Age", 0, 120, 60)
 
-            explain("Blood pressure (top number)",
-                    "Higher values can strain the kidneys over time.")
+            explain("Blood pressure (top number)", "Higher values can strain the kidneys over time.")
             systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, 140)
 
-            explain("Blood pressure (bottom number)",
-                    "Shows how your heart rests between beats.")
+            explain("Blood pressure (bottom number)", "Shows how your heart rests between beats.")
             diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, 85)
 
-            explain("Creatinine",
-                    "A waste product filtered by kidneys. Higher values may suggest reduced filtering.")
+            explain("Creatinine", "A waste product filtered by kidneys.")
             serumcreatinine = st.number_input("Creatinine (mg/dL)", 0.2, 15.0, 2.0)
 
-            explain("BUN",
-                    "Another waste product. Can rise with dehydration or kidney stress.")
+            explain("BUN", "Another waste product related to kidney filtering.")
             bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, 28.0)
 
         with col2:
-            explain("GFR",
-                    "Estimates how well your kidneys filter blood. Higher is generally better.")
+            explain("GFR", "Estimates how well your kidneys filter blood.")
             gfr = st.number_input("GFR", 1.0, 200.0, 55.0)
 
-            explain("Urine protein (ACR)",
-                    "Protein leaking into urine can signal kidney damage.")
+            explain("Urine protein (ACR)", "Protein leaking into urine can signal kidney damage.")
             acr = st.number_input("ACR (mg/g)", 0.0, 5000.0, 120.0)
 
-            explain("Potassium",
-                    "Important for heart rhythm. Very high levels can be dangerous.")
+            explain("Potassium", "Important for heart rhythm.")
             potassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, 4.8)
 
-            explain("Hemoglobin",
-                    "Measures red blood cells. Low levels are common in kidney disease.")
+            explain("Hemoglobin", "Measures red blood cells.")
             hemoglobin = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, 12.5)
 
         submitted = st.form_submit_button("Check kidney health")
 
     # -------------------------
-    # Helper: patient-friendly concern labels
+    # Concern label
     # -------------------------
     def concern_label(prob):
         if prob >= 0.75:
             return "🟠 Higher concern", "is-warn"
         elif prob >= 0.4:
-            return "🟡 Moderate concern", "is-mid"
+            return "🟡 Moderate concern", "is-info"
         else:
             return "🟢 Lower concern", "is-ok"
 
     # -------------------------
-    # MULTI-MODEL RESULTS
+    # RUN PREDICTION
     # -------------------------
     if submitted:
         payload = sanitize_payload({
@@ -1062,83 +1048,122 @@ with tab_single:
             "hemoglobinlevels": hemoglobin,
         })
 
+        st.session_state["last_pred_payload"] = payload
+        st.session_state["last_pred_results"] = {}
+
         st.markdown("### Your results (by model)")
 
         for model_key in selected_models:
             model_name = MODEL_KEYS.get(model_key, model_key)
 
-            with st.spinner(f"Analyzing with {model_name}…"):
-                res = _api_post(
-                    f"{st.session_state['api_url']}/predict",
-                    json_body=payload,
-                    params={"model": model_key},
-                    timeout=20
-                )
-
-                explain_res = _api_post(
-                    f"{st.session_state['api_url']}/explain",
-                    json_body=payload,
-                    params={"model": model_key},
-                    timeout=20
-                )
-
-            prob = float(res.get("prob_ckd", 0.0))
-            label, badge_cls = concern_label(prob)
-
-            st.markdown(
-                f"""
-                <div class="card">
-                  <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <b>{model_name}</b>
-                    <span class="badge {badge_cls}">{label}</span>
-                  </div>
-                  <div style="font-size:26px;font-weight:900;margin-top:6px;">
-                    {prob:.0%}
-                  </div>
-                  <div class="small-muted">
-                    This reflects how similar your results are to patterns
-                    that often benefit from kidney follow-up care.
-                  </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-            # -------- WHY (SHAP — PATIENT LANGUAGE)
-            st.markdown("**Why this result looks this way**")
-
-            top = explain_res.get("top", [])
-
-            if top:
-                shown = 0
-                for item in top:
-                    if item["feature"] in ("age", "gender"):
-                        continue
-
-                    direction = (
-                        "increased concern"
-                        if item["signed"] > 0
-                        else "reduced concern"
+            try:
+                with st.spinner(f"Analyzing with {model_name}…"):
+                    # ---- Prediction
+                    res = _api_post(
+                        f"{st.session_state['api_url']}/predict",
+                        json_body=payload,
+                        params={"model": model_key},
+                        timeout=20
                     )
 
-                    st.write(
-                        f"- **{pretty_feature_name(item['feature'])}** {direction}"
+                    # ---- Explainability (SAFE)
+                    top_drivers, raw_explain, explain_mode = explain_with_fallback(
+                        api_base=st.session_state["api_url"],
+                        payload=payload,
+                        model_key=model_key
                     )
 
-                    shown += 1
-                    if shown >= 3:
-                        break
-            else:
-                st.caption(
-                    "No single lab value stood out on its own. "
-                    "This result reflects several values working together."
+                prob = float(res.get("prob_ckd", 0.0))
+                thr = float(res.get("threshold_used", 0.5))
+                label, badge_cls = concern_label(prob)
+
+                # ---- Store results
+                st.session_state["last_pred_results"][model_key] = {
+                    **res,
+                    "top_drivers": top_drivers,
+                    "threshold_used": thr
+                }
+
+                # ---- Summary card (matches screenshot)
+                st.markdown(
+                    f"""
+                    <div class="card">
+                      <div style="display:flex;justify-content:space-between;align-items:center;">
+                        <b>{model_name}</b>
+                        <span class="badge {badge_cls}">
+                          {"Above threshold" if prob >= thr else "Below threshold"}
+                        </span>
+                      </div>
+                      <div class="kpi">
+                        <div class="metric">
+                          <b>Probability of CKD</b>
+                          <span>{prob:.3f}</span>
+                        </div>
+                        <div class="metric">
+                          <b>Decision Threshold</b>
+                          <span>{thr:.3f}</span>
+                        </div>
+                      </div>
+                      <div class="small-muted">
+                        A probability at or above the threshold is flagged for follow-up by this model.
+                      </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True
                 )
+
+                st.markdown("### What it means")
+                st.write(
+                    "This model would flag for **kidney follow-up care**."
+                    if prob >= thr else
+                    "This model would **not** flag for kidney follow-up care."
+                )
+
+                # -------------------------
+                # SHAP / Drivers section
+                # -------------------------
+                st.markdown("### Why did the model think that? (Top drivers)")
+                st.caption("Higher bars = stronger influence on the decision for this case.")
+
+                if top_drivers:
+                    df_imp = pd.DataFrame(top_drivers)
+                    df_imp["feature"] = df_imp["feature"].map(pretty_feature_name)
+                    df_imp["impact"] = df_imp["impact"].abs()
+
+                    fig = px.bar(
+                        df_imp.sort_values("impact"),
+                        x="impact",
+                        y="feature",
+                        orientation="h",
+                        labels={"impact": "Impact (Δprob)", "feature": "Feature"},
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    for row in top_drivers[:5]:
+                        direction = "↓ reduced concern" if row["signed"] < 0 else "↑ increased concern"
+                        st.write(
+                            f"- **{pretty_feature_name(row['feature'])}** {direction} "
+                            f"(Δprob={row['signed']:+.3f})"
+                        )
+                else:
+                    st.caption(
+                        "No single lab value stood out strongly. "
+                        "This result reflects multiple factors working together."
+                    )
+
+                if explain_mode == "local_sensitivity":
+                    st.caption(
+                        "Explanation based on how small changes in values affect the result."
+                    )
+
+            except Exception as e:
+                st.error(f"{model_name} is temporarily unavailable.")
+                st.caption(str(e))
 
         st.caption(
             "Educational tool only. Results are meant to support conversations "
             "with a healthcare professional."
         )
-
 
         # -------------------------
         # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
