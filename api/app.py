@@ -32,6 +32,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.include_router(metrics_router)
 
 @app.get("/", include_in_schema=False)
 def root():
