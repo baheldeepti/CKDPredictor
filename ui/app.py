@@ -968,11 +968,26 @@ with tab_single:
     st.markdown("""
     ## Kidney health check
 
-    This tool helps **understand kidney-related lab patterns**  
-    and whether **follow-up may be helpful**.
+    This tool helps you understand whether your **recent lab results**
+    look similar to patterns that often need **kidney follow-up**.
 
     It does **not diagnose disease**.
     """)
+
+    # -------------------------
+    # Patient-friendly input explanations
+    # -------------------------
+    INPUT_HELP = {
+        "age": "Age can affect kidney function over time.",
+        "systolicbp": "Top blood pressure number. High values can strain the kidneys.",
+        "diastolicbp": "Bottom blood pressure number.",
+        "serumcreatinine": "A waste product in the blood. Higher levels can mean lower kidney filtering.",
+        "bunlevels": "Blood urea nitrogen (BUN). Another waste marker that can rise with kidney stress or dehydration.",
+        "gfr": "Estimated kidney filtering rate. Higher is generally better.",
+        "acr": "Protein leaking into urine. Higher levels can signal kidney damage.",
+        "serumelectrolytespotassium": "Potassium level. Very high values can be dangerous.",
+        "hemoglobinlevels": "Measures anemia. Low levels are common in kidney disease.",
+    }
 
     # -------------------------
     # INPUT FORM
@@ -982,16 +997,49 @@ with tab_single:
         col1, col2 = st.columns(2)
 
         with col1:
-            age = st.number_input("Age", 0, 120, 60)
-            systolicbp = st.number_input("Top blood pressure number", 70, 260, 140)
-            diastolicbp = st.number_input("Bottom blood pressure number", 40, 160, 85)
-            serumcreatinine = st.number_input("Creatinine (blood waste marker)", 0.2, 15.0, 2.0)
+            age = st.number_input("Age", 0, 120, 60, help=INPUT_HELP["age"])
+            systolicbp = st.number_input(
+                "Systolic blood pressure",
+                70, 260, 140,
+                help=INPUT_HELP["systolicbp"]
+            )
+            diastolicbp = st.number_input(
+                "Diastolic blood pressure",
+                40, 160, 85,
+                help=INPUT_HELP["diastolicbp"]
+            )
+            serumcreatinine = st.number_input(
+                "Creatinine (mg/dL)",
+                0.2, 15.0, 2.0,
+                help=INPUT_HELP["serumcreatinine"]
+            )
+            bunlevels = st.number_input(
+                "BUN (mg/dL)",
+                1.0, 200.0, 28.0,
+                help=INPUT_HELP["bunlevels"]
+            )
 
         with col2:
-            gfr = st.number_input("GFR (kidney filtering rate)", 1.0, 200.0, 55.0)
-            acr = st.number_input("Urine protein (ACR)", 0.0, 5000.0, 120.0)
-            potassium = st.number_input("Potassium", 2.0, 7.5, 4.8)
-            hemoglobin = st.number_input("Hemoglobin", 5.0, 20.0, 12.5)
+            gfr = st.number_input(
+                "GFR",
+                1.0, 200.0, 55.0,
+                help=INPUT_HELP["gfr"]
+            )
+            acr = st.number_input(
+                "Urine protein (ACR)",
+                0.0, 5000.0, 120.0,
+                help=INPUT_HELP["acr"]
+            )
+            potassium = st.number_input(
+                "Potassium",
+                2.0, 7.5, 4.8,
+                help=INPUT_HELP["serumelectrolytespotassium"]
+            )
+            hemoglobin = st.number_input(
+                "Hemoglobin",
+                5.0, 20.0, 12.5,
+                help=INPUT_HELP["hemoglobinlevels"]
+            )
 
         submitted = st.form_submit_button("Check kidney health")
 
@@ -1007,6 +1055,7 @@ with tab_single:
                 "systolicbp": systolicbp,
                 "diastolicbp": diastolicbp,
                 "serumcreatinine": serumcreatinine,
+                "bunlevels": bunlevels,
                 "gfr": gfr,
                 "acr": acr,
                 "serumelectrolytespotassium": potassium,
@@ -1030,45 +1079,64 @@ with tab_single:
         follow_up = prob >= thr
 
         # -------------------------
-        # MAIN RESULT (PATIENT FRIENDLY)
+        # MAIN RESULT
         # -------------------------
         st.markdown("### Result")
 
         if follow_up:
-            st.success("**Follow-up is recommended**")
+            st.success("**Follow-up recommended**")
             st.write(
-                f"Your results look similar to people who often need further kidney evaluation. "
-                f"This estimate is **{prob:.0%}**, which is above the level where doctors usually take a closer look."
+                f"The model estimates a **{prob:.0%} likelihood** based on patterns it has seen before. "
+                "This is above the level where clinicians usually take a closer look."
             )
         else:
             st.info("**No immediate follow-up flagged**")
             st.write(
-                f"Your results look less similar to people with kidney disease. "
-                f"The estimate is **{prob:.0%}**, which is below the follow-up level."
+                f"The model estimates a **{prob:.0%} likelihood**, which is below the usual follow-up level."
             )
 
         st.caption("This is a screening estimate, not a diagnosis.")
 
         # -------------------------
-        # WHY THIS RESULT (SHAP, TRANSLATED)
+        # WHY THIS RESULT (SHAP BARS + SENTENCES)
         # -------------------------
-        st.markdown("### What influenced this result")
+        st.markdown("### Why did the model think this?")
 
         if drivers:
             df = pd.DataFrame(drivers)
-            df["impact"] = df["signed"].abs()
-            df = df.sort_values("impact", ascending=False).head(5)
 
+            # Remove age & gender from display
+            df = df[~df["feature"].isin(["age", "gender"])]
+
+            df["impact"] = df["signed"].abs()
+            df = df.sort_values("impact", ascending=False).head(6)
+
+            # --- Bar chart ---
+            fig = px.bar(
+                df,
+                y="feature",
+                x="impact",
+                orientation="h",
+                title="Factors with the strongest influence",
+                labels={
+                    "impact": "Influence on the decision",
+                    "feature": "Factor"
+                }
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # --- Plain language bullets ---
+            st.markdown("**In plain language:**")
             for _, row in df.iterrows():
-                direction = "raised" if row["signed"] > 0 else "lowered"
+                direction = "increased" if row["signed"] > 0 else "reduced"
                 st.write(
                     f"- **{pretty_feature_name(row['feature'])}** {direction} the likelihood"
                 )
         else:
-            st.write("No single factor stood out strongly.")
+            st.write("No single factor strongly influenced this result.")
 
         # -------------------------
-        # AI NEXT STEPS (FIXED)
+        # AI NEXT STEPS
         # -------------------------
         if "ai_next_steps" not in st.session_state:
             st.session_state.ai_next_steps = None
@@ -1080,7 +1148,7 @@ with tab_single:
                 txt = call_llm(
                     system_prompt="""
                     You explain kidney results to patients.
-                    Use calm, plain language.
+                    Use calm, clear language.
                     No diagnosis. No medication advice.
                     """,
                     user_prompt=f"""
@@ -1091,13 +1159,12 @@ with tab_single:
                     {drivers}
 
                     Explain:
-                    - What this means
-                    - Why follow-up matters or not
+                    - What this result means
+                    - Why follow-up may help
                     - 5 practical next steps
                     - When to seek urgent help
                     """
                 )
-
                 st.session_state.ai_next_steps = txt or "Explanation unavailable."
 
         if st.session_state.ai_next_steps:
@@ -1112,7 +1179,7 @@ with tab_single:
             )
 
         # -------------------------
-        # CONFUSION MATRIX (OPTIONAL, COLLAPSED)
+        # CONFUSION MATRIX (OPTIONAL)
         # -------------------------
         with st.expander("How accurate is this model?"):
             try:
