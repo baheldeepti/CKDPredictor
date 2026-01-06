@@ -967,6 +967,9 @@ with tab_chat:
 # =========================
 # Single prediction (PATIENT-FIRST, MULTI-MODEL)
 # =========================
+# =========================
+# Single prediction (PATIENT-FIRST, MULTI-MODEL)
+# =========================
 with tab_single:
 
     st.markdown("""
@@ -979,12 +982,12 @@ with tab_single:
     """)
 
     st.info(
-        "Think of this like a **weather forecast** for kidney health — "
+        "Think of this like a **weather forecast for kidney health** — "
         "it estimates trends, not certainties."
     )
 
     # -------------------------
-    # Visible explanations (NOT tooltips)
+    # Visible explanations (NO tooltips)
     # -------------------------
     def explain(label, text):
         st.markdown(f"**{label}**")
@@ -997,32 +1000,51 @@ with tab_single:
             explain("Age", "Kidney function naturally changes as we age.")
             age = st.number_input("Age", 0, 120, 60)
 
-            explain("Blood pressure (top number)", "High pressure can strain the kidneys over time.")
+            explain("Blood pressure (top number)",
+                    "Higher values can strain the kidneys over time.")
             systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, 140)
 
-            explain("Blood pressure (bottom number)", "Helps show how hard your heart rests between beats.")
+            explain("Blood pressure (bottom number)",
+                    "Shows how your heart rests between beats.")
             diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, 85)
 
-            explain("Creatinine", "A waste product filtered by kidneys. Higher values may mean reduced filtering.")
+            explain("Creatinine",
+                    "A waste product filtered by kidneys. Higher values may suggest reduced filtering.")
             serumcreatinine = st.number_input("Creatinine (mg/dL)", 0.2, 15.0, 2.0)
 
-            explain("BUN", "Another waste product. Can rise with dehydration or kidney stress.")
+            explain("BUN",
+                    "Another waste product. Can rise with dehydration or kidney stress.")
             bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, 28.0)
 
         with col2:
-            explain("GFR", "Estimates how well your kidneys filter blood. Higher is generally better.")
+            explain("GFR",
+                    "Estimates how well your kidneys filter blood. Higher is generally better.")
             gfr = st.number_input("GFR", 1.0, 200.0, 55.0)
 
-            explain("Urine protein (ACR)", "Protein leaking into urine can signal kidney damage.")
+            explain("Urine protein (ACR)",
+                    "Protein leaking into urine can signal kidney damage.")
             acr = st.number_input("ACR (mg/g)", 0.0, 5000.0, 120.0)
 
-            explain("Potassium", "Important for heart rhythm. Very high levels can be dangerous.")
+            explain("Potassium",
+                    "Important for heart rhythm. Very high levels can be dangerous.")
             potassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, 4.8)
 
-            explain("Hemoglobin", "Measures red blood cells. Low levels are common in kidney disease.")
+            explain("Hemoglobin",
+                    "Measures red blood cells. Low levels are common in kidney disease.")
             hemoglobin = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, 12.5)
 
         submitted = st.form_submit_button("Check kidney health")
+
+    # -------------------------
+    # Helper: patient-friendly concern labels
+    # -------------------------
+    def concern_label(prob):
+        if prob >= 0.75:
+            return "🟠 Higher concern", "is-warn"
+        elif prob >= 0.4:
+            return "🟡 Moderate concern", "is-mid"
+        else:
+            return "🟢 Lower concern", "is-ok"
 
     # -------------------------
     # MULTI-MODEL RESULTS
@@ -1043,7 +1065,9 @@ with tab_single:
         st.markdown("### Your results (by model)")
 
         for model_key in selected_models:
-            with st.spinner(f"Evaluating with {MODEL_KEYS.get(model_key, model_key)}…"):
+            model_name = MODEL_KEYS.get(model_key, model_key)
+
+            with st.spinner(f"Analyzing with {model_name}…"):
                 res = _api_post(
                     f"{st.session_state['api_url']}/predict",
                     json_body=payload,
@@ -1051,51 +1075,70 @@ with tab_single:
                     timeout=20
                 )
 
-            prob = float(res.get("prob_ckd", 0.0))
-            thr  = float(res.get("threshold_used", 0.5))
-            flagged = prob >= thr
+                explain_res = _api_post(
+                    f"{st.session_state['api_url']}/explain",
+                    json_body=payload,
+                    params={"model": model_key},
+                    timeout=20
+                )
 
-            badge = "Follow-up suggested" if flagged else "No immediate concern"
-            badge_cls = "is-warn" if flagged else "is-ok"
+            prob = float(res.get("prob_ckd", 0.0))
+            label, badge_cls = concern_label(prob)
 
             st.markdown(
                 f"""
                 <div class="card">
                   <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <b>{MODEL_KEYS.get(model_key, model_key)}</b>
-                    <span class="badge {badge_cls}">{badge}</span>
+                    <b>{model_name}</b>
+                    <span class="badge {badge_cls}">{label}</span>
                   </div>
                   <div style="font-size:26px;font-weight:900;margin-top:6px;">
                     {prob:.0%}
                   </div>
                   <div class="small-muted">
-                    Follow-up is commonly suggested above <b>{thr:.0%}</b>
+                    This reflects how similar your results are to patterns
+                    that often benefit from kidney follow-up care.
                   </div>
                 </div>
                 """,
                 unsafe_allow_html=True
             )
 
-            # -------- WHY (SAFE)
-            st.markdown("**What influenced this result**")
+            # -------- WHY (SHAP — PATIENT LANGUAGE)
+            st.markdown("**Why this result looks this way**")
 
-            drivers = res.get("top_drivers")
-            if isinstance(drivers, list) and drivers and "feature" in drivers[0]:
-                df = pd.DataFrame(drivers)
-                df = df[~df["feature"].isin(["age", "gender"])]
-                df["impact"] = df["signed"].abs()
-                df = df.sort_values("impact", ascending=False).head(3)
+            top = explain_res.get("top", [])
 
-                for _, r in df.iterrows():
-                    direction = "raised concern" if r["signed"] > 0 else "lowered concern"
-                    st.write(f"- **{pretty_feature_name(r['feature'])}** {direction}")
+            if top:
+                shown = 0
+                for item in top:
+                    if item["feature"] in ("age", "gender"):
+                        continue
+
+                    direction = (
+                        "increased concern"
+                        if item["signed"] > 0
+                        else "reduced concern"
+                    )
+
+                    st.write(
+                        f"- **{pretty_feature_name(item['feature'])}** {direction}"
+                    )
+
+                    shown += 1
+                    if shown >= 3:
+                        break
             else:
                 st.caption(
-                    "This result reflects **several small factors combined**, "
-                    "rather than one single abnormal value."
+                    "No single lab value stood out on its own. "
+                    "This result reflects several values working together."
                 )
 
-        st.caption("Educational tool only. Not medical advice.")
+        st.caption(
+            "Educational tool only. Results are meant to support conversations "
+            "with a healthcare professional."
+        )
+
 
         # -------------------------
         # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
