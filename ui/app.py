@@ -26,7 +26,6 @@ import pandas as pd
 import plotly.express as px
 from typing import Dict, Any, List, Tuple
 
-
 # =========================
 # Branding & Config
 # =========================
@@ -722,7 +721,7 @@ with st.sidebar:
         "This tool does **not** provide a medical diagnosis. Consult a clinician."
     )
 
-# ========================
+# =========================
 # Header + Controls
 # =========================
 st.title(f"🧭 {APP_TITLE}")
@@ -961,237 +960,225 @@ with tab_chat:
         st.caption("Context loaded → " + " • ".join(chips))
     else:
         st.caption("No context loaded yet.")
+
 # =========================
-# Single prediction (PATIENT-FIRST, MULTI-MODEL, SAFE)
+# Single prediction
 # =========================
 with tab_single:
+    st.markdown("Enter values and click **Predict**. See model outputs and top drivers.")
 
-    st.markdown("""
-    ## Kidney health check
+    # Prefill / Reset controls
+    c1, c2, c3 = st.columns([1,1,2])
+    with c1:
+        sample_idx = st.selectbox("Prefill sample", [1,2,3,4,5], index=1, key="sp_sample_idx")
+    with c2:
+        do_prefill = st.button("Use sample", key="sp_use_sample")
+    with c3:
+        do_reset = st.button("Reset form", key="sp_reset")
 
-    This tool compares your recent lab values with patterns seen in people
-    who sometimes benefit from **kidney follow-up care**.
+    def _defaults(si=None):
+        df = sample_records_df()
+        if si is not None:
+            row = df.iloc[si-1].to_dict()
+            return (
+                int(row["age"]), int(row["gender"]),
+                int(row["systolicbp"]), int(row["diastolicbp"]),
+                float(row["serumcreatinine"]), float(row["bunlevels"]),
+                float(row["gfr"]), float(row["acr"]),
+                float(row["serumelectrolytessodium"]), float(row["serumelectrolytespotassium"]),
+                float(row["hemoglobinlevels"]), float(row["hba1c"])
+            )
+        return (60, 1, 140, 85, 2.0, 28.0, 55.0, 120.0, 138.0, 4.8, 12.5, 6.8)
 
-    **It does not diagnose disease.**
-    """)
+    if do_reset:
+        st.rerun()
 
-    st.info(
-        "Think of this like a **weather forecast for kidney health** — "
-        "it estimates trends, not certainties."
-    )
-
-    # -------------------------
-    # Visible explanations
-    # -------------------------
-    def explain(label, text):
-        st.markdown(f"**{label}**")
-        st.caption(text)
+    # Initialize form values
+    if do_prefill:
+        (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults(sample_idx)
+    else:
+        (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults()
 
     with st.form("predict_form", border=True):
         col1, col2 = st.columns(2)
 
         with col1:
-            explain("Age", "Kidney function naturally changes as we age.")
-            age = st.number_input("Age", 0, 120, 60)
-
-            explain("Blood pressure (top number)", "Higher values can strain the kidneys over time.")
-            systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, 140)
-
-            explain("Blood pressure (bottom number)", "Shows how your heart rests between beats.")
-            diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, 85)
-
-            explain("Creatinine", "A waste product filtered by kidneys.")
-            serumcreatinine = st.number_input("Creatinine (mg/dL)", 0.2, 15.0, 2.0)
-
-            explain("BUN", "Another waste product related to kidney filtering.")
-            bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, 28.0)
-
+            age = st.number_input("Age (years)", 0, 120, age_d, key="sp_age")
+            gender_index = 1 if int(gender_d) == 1 else 0
+            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1], index=gender_index, key="sp_gender")
+            systolicbp = st.number_input("Systolic BP (mmHg)", 70, 260, sbp_d, key="sp_sbp")
+            diastolicbp = st.number_input("Diastolic BP (mmHg)", 40, 160, dbp_d, key="sp_dbp")
+            serumcreatinine = st.number_input("Serum creatinine (mg/dL)", 0.2, 15.0, sc_d, step=0.1, key="sp_sc")
+            bunlevels = st.number_input("BUN (mg/dL)", 1.0, 200.0, bun_d, step=0.5, key="sp_bun")
+            gfr = st.number_input("GFR (mL/min/1.73m²)", 1.0, 200.0, gfr_d, step=0.5, key="sp_gfr")
+            acr = st.number_input("Albumin/creatinine ratio, ACR (mg/g)", 0.0, 5000.0, acr_d, step=1.0, key="sp_acr")
         with col2:
-            explain("GFR", "Estimates how well your kidneys filter blood.")
-            gfr = st.number_input("GFR", 1.0, 200.0, 55.0)
+            serumelectrolytessodium = st.number_input("Sodium (mEq/L)", 110.0, 170.0, na_d, step=0.5, key="sp_na")
+            serumelectrolytespotassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, k_d, step=0.1, key="sp_k")
+            hemoglobinlevels = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, hb_d, step=0.1, key="sp_hb")
+            hba1c = st.number_input("HbA1c (%)", 3.5, 15.0, a1c_d, step=0.1, key="sp_a1c")
 
-            explain("Urine protein (ACR)", "Protein leaking into urine can signal kidney damage.")
-            acr = st.number_input("ACR (mg/g)", 0.0, 5000.0, 120.0)
+            bp_risk, hyperkalemiaflag, anemiaflag, ckdstage, albuminuriacat = derive_flags_and_bins(
+                systolicbp, diastolicbp, serumelectrolytespotassium, hemoglobinlevels, gfr, acr
+            )
 
-            explain("Potassium", "Important for heart rhythm.")
-            potassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, 4.8)
+        pulsepressure = systolicbp - diastolicbp
+        ureacreatinineratio = float(bunlevels) / (float(serumcreatinine) + 1e-6)
 
-            explain("Hemoglobin", "Measures red blood cells.")
-            hemoglobin = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, 12.5)
+        st.caption(
+            f"Derived → Pulse pressure={pulsepressure} • Urea/Creatinine={ureacreatinineratio:.2f} • "
+            f"Flags: High BP={bp_risk}, Hyperkalemia={hyperkalemiaflag}, Anemia={anemiaflag} • "
+            f"CKD stage={ckdstage}, Albuminuria category={albuminuriacat}"
+        )
 
-        submitted = st.form_submit_button("Check kidney health")
+        do_predict = st.form_submit_button("Predict with selected models", use_container_width=True, disabled=False, help="Runs the selected models")
 
-    # -------------------------
-    # Concern label
-    # -------------------------
-    def concern_label(prob):
-        if prob >= 0.75:
-            return "🟠 Higher concern", "is-warn"
-        elif prob >= 0.4:
-            return "🟡 Moderate concern", "is-info"
-        else:
-            return "🟢 Lower concern", "is-ok"
-
-    # -------------------------
-    # RUN PREDICTION
-    # -------------------------
-    if submitted:
-        payload = sanitize_payload({
-            "age": age,
-            "systolicbp": systolicbp,
-            "diastolicbp": diastolicbp,
-            "serumcreatinine": serumcreatinine,
-            "bunlevels": bunlevels,
-            "gfr": gfr,
-            "acr": acr,
-            "serumelectrolytespotassium": potassium,
-            "hemoglobinlevels": hemoglobin,
-        })
-
+    if do_predict:
+        payload = {
+            "age": age, "gender": gender,
+            "systolicbp": systolicbp, "diastolicbp": diastolicbp,
+            "serumcreatinine": serumcreatinine, "bunlevels": bunlevels,
+            "gfr": gfr, "acr": acr,
+            "serumelectrolytessodium": serumelectrolytessodium,
+            "serumelectrolytespotassium": serumelectrolytespotassium,
+            "hemoglobinlevels": hemoglobinlevels, "hba1c": hba1c,
+            "pulsepressure": pulsepressure, "ureacreatinineratio": ureacreatinineratio,
+            "ckdstage": ckdstage, "albuminuriacat": albuminuriacat,
+            "bp_risk": bp_risk, "hyperkalemiaflag": hyperkalemiaflag, "anemiaflag": anemiaflag
+        }
+        payload = sanitize_payload(payload)
         st.session_state["last_pred_payload"] = payload
         st.session_state["last_pred_results"] = {}
 
-        st.markdown("### Your results (by model)")
-
-        for model_key in selected_models:
-            model_name = MODEL_KEYS.get(model_key, model_key)
-
+        cols = st.columns(len(selected_models))
+        for idx, m in enumerate(selected_models):
             try:
-                with st.spinner(f"Analyzing with {model_name}…"):
-                    # ---- Prediction
-                    res = _api_post(
-                        f"{st.session_state['api_url']}/predict",
-                        json_body=payload,
-                        params={"model": model_key},
-                        timeout=20
-                    )
-
-                    # ---- Explainability (SAFE)
-                    top_drivers, raw_explain, explain_mode = explain_with_fallback(
-                        api_base=st.session_state["api_url"],
-                        payload=payload,
-                        model_key=model_key
-                    )
-
-                prob = float(res.get("prob_ckd", 0.0))
-                thr = float(res.get("threshold_used", 0.5))
-                label, badge_cls = concern_label(prob)
-
-                # ---- Store results
-                st.session_state["last_pred_results"][model_key] = {
-                    **res,
-                    "top_drivers": top_drivers,
-                    "threshold_used": thr
-                }
-
-                # ---- Summary card (matches screenshot)
-                st.markdown(
-                    f"""
-                    <div class="card">
-                      <div style="display:flex;justify-content:space-between;align-items:center;">
-                        <b>{model_name}</b>
-                        <span class="badge {badge_cls}">
-                          {"Above threshold" if prob >= thr else "Below threshold"}
-                        </span>
-                      </div>
-                      <div class="kpi">
-                        <div class="metric">
-                          <b>Probability of CKD</b>
-                          <span>{prob:.3f}</span>
+                res = _api_post(f"{st.session_state['api_url']}/predict", json_body=payload, params={"model": m}, timeout=20)
+                st.session_state["last_pred_results"][m] = res
+                with cols[idx]:
+                    # Result card
+                    prob = float(res.get("prob_ckd", 0.0))
+                    thr  = float(res.get("threshold_used", 0.5))
+                    model_used = res.get("model_used", m)
+                    label = "Above threshold" if prob >= thr else ("Moderate risk" if prob >= 0.33 else "Lower risk")
+                    # Use tokenized badge variants for consistent polish
+                    badge_cls = "is-bad" if prob >= thr else ("is-warn" if prob >= 0.33 else "is-ok")
+                    st.markdown(
+                        f"""
+                        <div class="card">
+                          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                            <div style="font-size:18px;font-weight:800;color:var(--brand-800);">{MODEL_KEYS.get(model_used, model_used)}</div>
+                            <div class="badge {badge_cls}">{label}</div>
+                          </div>
+                          <div class="kpi">
+                            <div class="metric"><b>Probability of CKD</b><span>{prob:.3f}</span></div>
+                            <div class="metric"><b>Decision Threshold</b><span>{thr:.3f}</span></div>
+                          </div>
+                          <div class="small-muted" style="margin-top:8px;">
+                            A probability at or above the threshold is flagged for CKD follow-up by this model.
+                          </div>
                         </div>
-                        <div class="metric">
-                          <b>Decision Threshold</b>
-                          <span>{thr:.3f}</span>
-                        </div>
-                      </div>
-                      <div class="small-muted">
-                        A probability at or above the threshold is flagged for follow-up by this model.
-                      </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-                st.markdown("### What it means")
-                st.write(
-                    "This model would flag for **kidney follow-up care**."
-                    if prob >= thr else
-                    "This model would **not** flag for kidney follow-up care."
-                )
-
-                # -------------------------
-                # SHAP / Drivers section
-                # -------------------------
-                st.markdown("### Why did the model think that? (Top drivers)")
-                st.caption("Higher bars = stronger influence on the decision for this case.")
-
-                if top_drivers:
-                    df_imp = pd.DataFrame(top_drivers)
-                    df_imp["feature"] = df_imp["feature"].map(pretty_feature_name)
-                    df_imp["impact"] = df_imp["impact"].abs()
-
-                    fig = px.bar(
-                        df_imp.sort_values("impact"),
-                        x="impact",
-                        y="feature",
-                        orientation="h",
-                        labels={"impact": "Impact (Δprob)", "feature": "Feature"},
+                        """,
+                        unsafe_allow_html=True,
                     )
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    for row in top_drivers[:5]:
-                        direction = "↓ reduced concern" if row["signed"] < 0 else "↑ increased concern"
-                        st.write(
-                            f"- **{pretty_feature_name(row['feature'])}** {direction} "
-                            f"(Δprob={row['signed']:+.3f})"
-                        )
-                else:
-                    st.caption(
-                        "No single lab value stood out strongly. "
-                        "This result reflects multiple factors working together."
-                    )
-
-                if explain_mode == "local_sensitivity":
-                    st.caption(
-                        "Explanation based on how small changes in values affect the result."
-                    )
-
+                    st.markdown("**What it means**")
+                    st.markdown("This model would **flag** for CKD **follow-up**." if prob >= thr else "This model would **not** flag for CKD at this time.")
+            except requests.HTTPError as e:
+                with cols[idx]:
+                    st.error(f"{MODEL_KEYS.get(m,m)} failed")
+                    msg = getattr(e.response, "text", str(e)) or str(e)
+                    st.code(msg, language="json")
+                _log(f"Single predict HTTP ERROR ({m}): {e}")
             except Exception as e:
-                st.error(f"{model_name} is temporarily unavailable.")
-                st.caption(str(e))
+                with cols[idx]:
+                    st.error(f"{MODEL_KEYS.get(m,m)} error")
+                    st.caption(str(e))
+                _log(f"Single predict ERROR ({m}): {e}")
 
-        st.caption(
-            "Educational tool only. Results are meant to support conversations "
-            "with a healthcare professional."
-        )
+        # Explainability
+        st.markdown("#### Why did the model think that? (Top drivers)")
+        st.caption("Higher bars = stronger influence on the decision for this case.")
+        ecols = st.columns(len(selected_models))
+        for idx, m in enumerate(selected_models):
+            if m not in st.session_state["last_pred_results"]:
+                continue
+            with ecols[idx]:
+                try:
+                    top, raw_exp, mode = explain_with_fallback(st.session_state["api_url"], st.session_state["last_pred_payload"], m)
+                    if top:
+                        df_top = pd.DataFrame(top)
+                        if "impact" not in df_top.columns and "signed" in df_top.columns:
+                            df_top["impact"] = df_top["signed"].abs()
+                        # Ensure numeric + sort descending
+                        df_top["impact"] = pd.to_numeric(df_top["impact"], errors="coerce").fillna(0.0)
+                        df_sorted = df_top.sort_values("impact", ascending=False)
+                        
+                        # Plot with Plotly: lock category order (descending)
+                        fig = px.bar(
+                            df_sorted,
+                            y="feature",            # horizontal bars (readable labels)
+                            x="impact",
+                            orientation="h",
+                            text="impact",          # <-- ADD: use impact values as labels
+                            title=None
+                        )
+                        fig.update_traces(
+                            texttemplate="%{text:.3f}",   # <-- ADD: format labels
+                            textposition="outside",       # <-- ADD: place labels at end of bars
+                            cliponaxis=False              # <-- ADD: prevent clipping of labels
+                        )
+                        fig.update_layout(
+                            yaxis=dict(
+                                categoryorder="array",
+                                categoryarray=df_sorted["feature"].tolist()  # exact order we computed
+                            ),
+                            xaxis_title="Impact (|Δprob|)",
+                            yaxis_title="Feature",
+                            margin=dict(l=10, r=40, t=10, b=10),  # a little extra right margin for labels
+                            height=320,
+                            xaxis_range=[0, float(df_sorted["impact"].max()) * 1.15]  # <-- ADD: headroom for labels
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Bullets (top 5 in sorted order)
+                        bullets = "\n".join(
+                            f"- **{row['feature']}** {'↑' if float(row.get('signed',0))>0 else '↓'} risk (Δprob={float(row.get('signed',0)):+.3f})"
+                            for _, row in df_sorted.head(5).iterrows()
+                        )
+                        st.markdown(bullets)
 
-        # -------------------------
-        # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
-        # -------------------------
-        st.markdown("---")
-        st.markdown(
-            """
-            <div class="card">
-              <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-                <div>
-                  <div style="font-weight:900;color:var(--brand-800);font-size:16px;">Neon sponsored</div>
-                  <div class="small-muted" style="margin-top:6px;line-height:1.55;">
-                    <b>This project is proudly supported by Neon.</b><br/>
-                    Neon provides the serverless Postgres infrastructure that powers NephroCompass, enabling secure, scalable,
-                    and developer-friendly healthcare analytics.
-                  </div>
-                  <div style="margin-top:10px;">
-                    👉 <a href="https://console.neon.tech/app/?promo=nephro-compass" target="_blank" rel="noopener">
-                    https://console.neon.tech/app/?promo=nephro-compass</a>
-                  </div>
-                </div>
-                <div class="badge is-brand">Powered by Neon</div>
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+                        note = "Server SHAP" if mode == "server_shap" else "Local sensitivity fallback"
+                        st.caption(f"*Explainer: {note}*")
 
+                        # Store explainability context for Chat
+                        try:
+                            st.session_state["ctx_explain"] = {
+                                "schema_version": 1,
+                                "model": m,
+                                "top": top[:8],
+                                "mode": mode
+                            }
+                        except Exception:
+                            pass
+
+                        if raw_exp:
+                            with st.expander("Raw explanation (debug)", expanded=False):
+                                st.json(raw_exp)
+                    else:
+                        st.info("No features available for explanation.")
+                    _log(f"Explain OK ({m}) via {mode}.")
+                except requests.HTTPError as e:
+                    try:
+                        det = e.response.json()
+                    except Exception:
+                        det = getattr(e.response, "text", str(e))
+                    st.error("Explain failed")
+                    st.code(det, language="json")
+                    _log(f"Explain HTTP ERROR ({m}): {e}")
+                except Exception as e:
+                    st.error("Explain error")
+                    st.caption(str(e))
+                    _log(f"Explain ERROR ({m}): {e}")
 
 # =========================
 # Bulk predictions
