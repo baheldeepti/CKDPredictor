@@ -961,100 +961,21 @@ with tab_chat:
     else:
         st.caption("No context loaded yet.")
 # =========================
-# Single prediction (PATIENT-FRIENDLY + AI NEXT STEPS)
+# Single prediction (PATIENT-FRIENDLY)
 # =========================
 with tab_single:
 
     st.markdown("""
-    ### Kidney health check (educational)
+    ## Kidney health check
 
-    Enter recent lab and vital values below and click **Predict**.
+    This tool helps **understand kidney-related lab patterns**  
+    and whether **follow-up may be helpful**.
 
-    You’ll see:
-    - The model’s **estimated likelihood**
-    - Whether it **flags follow-up**
-    - What that means **in everyday language**
-    - Optional AI-generated **next steps**
-
-    This tool does **not** diagnose disease.
+    It does **not diagnose disease**.
     """)
 
     # -------------------------
-    # Patient-friendly explanations
-    # -------------------------
-    def explain_probability(prob: float) -> str:
-        return (
-            f"The model estimates a **{prob:.0%} likelihood** that this pattern looks similar to "
-            "people in its training data who had chronic kidney disease. "
-            "This is a statistical estimate, not a diagnosis."
-        )
-
-    def explain_threshold(prob: float, thr: float) -> str:
-        if prob >= thr:
-            return (
-                "Because this estimate is **above the model’s follow-up line**, "
-                "the model flags this result for closer review."
-            )
-        return (
-            "Because this estimate is **below the model’s follow-up line**, "
-            "the model does not flag this result — but trends and symptoms still matter."
-        )
-
-    def patient_result_label(prob: float, thr: float) -> tuple[str, str]:
-        if prob >= thr:
-            return ("Follow-up recommended", "is-bad")
-        if prob >= 0.33:
-            return ("Monitor closely", "is-warn")
-        return ("Lower concern", "is-ok")
-
-    # -------------------------
-    # AI explanation (FIXED)
-    # -------------------------
-    def ai_patient_summary(payload: dict, prob: float, thr: float, drivers: list[dict]) -> str:
-
-        driver_list = "\n".join(
-            f"- {pretty_feature_name(d['feature'])}"
-            for d in drivers[:5]
-        ) or "- No single dominant factor identified"
-
-        system_prompt = """
-        You are a kidney-health assistant writing for patients and caregivers.
-
-        Rules:
-        - Use plain, calm language
-        - Do NOT diagnose
-        - Explain probability and follow-up flags clearly
-        - No medication dosing
-        - Focus on understanding and next steps
-
-        Use short sections and bullets.
-        End with: Educational tool; not medical advice.
-        """
-
-        user_prompt = f"""
-        The model estimated a {prob:.0%} likelihood.
-        The follow-up line is at {thr:.0%}.
-
-        Context:
-        - CKD stage (from GFR): {payload.get("ckdstage")}
-        - Protein in urine category: {payload.get("albuminuriacat")}
-        - High blood pressure flag: {payload.get("bp_risk")}
-        - Anemia flag: {payload.get("anemiaflag")}
-
-        Factors that may be contributing:
-        {driver_list}
-
-        Write:
-        1. What this result means
-        2. Why follow-up may or may not be recommended
-        3. Top 5 practical next steps
-        4. When to seek urgent help
-        """
-
-        return call_llm(system_prompt, user_prompt)
-
-    # -------------------------
-    # Input form (unchanged)
+    # INPUT FORM
     # -------------------------
     with st.form("predict_form", border=True):
 
@@ -1062,96 +983,149 @@ with tab_single:
 
         with col1:
             age = st.number_input("Age", 0, 120, 60)
-            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1])
-            systolicbp = st.number_input("Systolic BP", 70, 260, 140)
-            diastolicbp = st.number_input("Diastolic BP", 40, 160, 85)
-            serumcreatinine = st.number_input("Creatinine", 0.2, 15.0, 2.0, step=0.1)
-            bunlevels = st.number_input("BUN", 1.0, 200.0, 28.0)
+            systolicbp = st.number_input("Top blood pressure number", 70, 260, 140)
+            diastolicbp = st.number_input("Bottom blood pressure number", 40, 160, 85)
+            serumcreatinine = st.number_input("Creatinine (blood waste marker)", 0.2, 15.0, 2.0)
 
         with col2:
-            gfr = st.number_input("GFR", 1.0, 200.0, 55.0)
-            acr = st.number_input("ACR", 0.0, 5000.0, 120.0)
-            serumelectrolytespotassium = st.number_input("Potassium", 2.0, 7.5, 4.8)
-            hemoglobinlevels = st.number_input("Hemoglobin", 5.0, 20.0, 12.5)
-            hba1c = st.number_input("HbA1c", 3.5, 15.0, 6.8)
+            gfr = st.number_input("GFR (kidney filtering rate)", 1.0, 200.0, 55.0)
+            acr = st.number_input("Urine protein (ACR)", 0.0, 5000.0, 120.0)
+            potassium = st.number_input("Potassium", 2.0, 7.5, 4.8)
+            hemoglobin = st.number_input("Hemoglobin", 5.0, 20.0, 12.5)
 
-        do_predict = st.form_submit_button("Predict")
+        submitted = st.form_submit_button("Check kidney health")
 
     # -------------------------
-    # Prediction output
+    # PREDICTION
     # -------------------------
-    if do_predict:
+    if submitted:
 
-        payload = sanitize_payload({
-            "age": age,
-            "gender": gender,
-            "systolicbp": systolicbp,
-            "diastolicbp": diastolicbp,
-            "serumcreatinine": serumcreatinine,
-            "bunlevels": bunlevels,
-            "gfr": gfr,
-            "acr": acr,
-            "serumelectrolytespotassium": serumelectrolytespotassium,
-            "hemoglobinlevels": hemoglobinlevels,
-            "hba1c": hba1c,
-        })
+        with st.spinner("Analyzing your results…"):
 
-        res = _api_post(
-            "https://ckdpredictor.onrender.com/predict",
-            json_body=payload,
-            timeout=20
-        )
+            payload = sanitize_payload({
+                "age": age,
+                "systolicbp": systolicbp,
+                "diastolicbp": diastolicbp,
+                "serumcreatinine": serumcreatinine,
+                "gfr": gfr,
+                "acr": acr,
+                "serumelectrolytespotassium": potassium,
+                "hemoglobinlevels": hemoglobin,
+            })
 
-        prob = float(res.get("prob_ckd", 0.0))
+            res = _api_post(
+                "https://ckdpredictor.onrender.com/predict",
+                json_body=payload,
+                timeout=20
+            )
+
+        if not res:
+            st.error("We couldn’t generate a result. Please try again.")
+            st.stop()
+
+        prob = float(res.get("prob_ckd", 0))
         thr = float(res.get("threshold_used", 0.5))
         drivers = res.get("top_drivers", [])
 
-        label, badge = patient_result_label(prob, thr)
+        follow_up = prob >= thr
 
-        st.markdown(
-            f"""
-            <div class="card">
-              <div style="display:flex;justify-content:space-between;">
-                <b>{label}</b>
-                <span class="badge {badge}">{label}</span>
-              </div>
-              <ul>
-                <li>{explain_probability(prob)}</li>
-                <li>{explain_threshold(prob, thr)}</li>
-              </ul>
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+        # -------------------------
+        # MAIN RESULT (PATIENT FRIENDLY)
+        # -------------------------
+        st.markdown("### Result")
+
+        if follow_up:
+            st.success("**Follow-up is recommended**")
+            st.write(
+                f"Your results look similar to people who often need further kidney evaluation. "
+                f"This estimate is **{prob:.0%}**, which is above the level where doctors usually take a closer look."
+            )
+        else:
+            st.info("**No immediate follow-up flagged**")
+            st.write(
+                f"Your results look less similar to people with kidney disease. "
+                f"The estimate is **{prob:.0%}**, which is below the follow-up level."
+            )
+
+        st.caption("This is a screening estimate, not a diagnosis.")
+
+        # -------------------------
+        # WHY THIS RESULT (SHAP, TRANSLATED)
+        # -------------------------
+        st.markdown("### What influenced this result")
+
+        if drivers:
+            df = pd.DataFrame(drivers)
+            df["impact"] = df["signed"].abs()
+            df = df.sort_values("impact", ascending=False).head(5)
+
+            for _, row in df.iterrows():
+                direction = "raised" if row["signed"] > 0 else "lowered"
+                st.write(
+                    f"- **{pretty_feature_name(row['feature'])}** {direction} the likelihood"
+                )
+        else:
+            st.write("No single factor stood out strongly.")
 
         # -------------------------
         # AI NEXT STEPS (FIXED)
         # -------------------------
-        if "ai_text" not in st.session_state:
-            st.session_state["ai_text"] = None
+        if "ai_next_steps" not in st.session_state:
+            st.session_state.ai_next_steps = None
 
-        if st.button("Explain this and suggest next steps"):
-            with st.spinner("Generating explanation…"):
-                txt = ai_patient_summary(payload, prob, thr, drivers)
-                if txt:
-                    st.session_state["ai_text"] = txt
-                else:
-                    st.session_state["ai_text"] = "⚠️ AI explanation could not be generated."
+        st.markdown("### What you can do next")
 
-        if st.session_state["ai_text"]:
+        if st.button("Explain this in plain language"):
+            with st.spinner("Writing explanation…"):
+                txt = call_llm(
+                    system_prompt="""
+                    You explain kidney results to patients.
+                    Use calm, plain language.
+                    No diagnosis. No medication advice.
+                    """,
+                    user_prompt=f"""
+                    Likelihood: {prob:.0%}
+                    Follow-up recommended: {follow_up}
+
+                    Factors:
+                    {drivers}
+
+                    Explain:
+                    - What this means
+                    - Why follow-up matters or not
+                    - 5 practical next steps
+                    - When to seek urgent help
+                    """
+                )
+
+                st.session_state.ai_next_steps = txt or "Explanation unavailable."
+
+        if st.session_state.ai_next_steps:
             st.markdown(
                 f"""
                 <div class="card">
-                  <div style="font-weight:800;margin-bottom:6px;">
-                    AI explanation & next steps
-                  </div>
-                  <div style="line-height:1.6;">
-                    {nl2br(st.session_state["ai_text"])}
-                  </div>
+                  <b>AI explanation</b><br><br>
+                  {nl2br(st.session_state.ai_next_steps)}
                 </div>
                 """,
                 unsafe_allow_html=True
             )
+
+        # -------------------------
+        # CONFUSION MATRIX (OPTIONAL, COLLAPSED)
+        # -------------------------
+        with st.expander("How accurate is this model?"):
+            try:
+                cm = _api_get(
+                    "https://ckdpredictor.onrender.com/metrics/confusion_matrix",
+                    timeout=10
+                )
+                if cm:
+                    st.json(cm)
+                else:
+                    st.write("Performance data not available.")
+            except Exception:
+                st.write("Performance data not available.")
 
     # -------------------------
     # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
