@@ -1151,32 +1151,33 @@ with tab_single:
                 st.json(cm)
             else:
                 st.write("Performance data currently unavailable.")
----------------------
-    # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
-    # -------------------------
-    st.markdown("---")
-    st.markdown(
-        """
-        <div class="card">
-          <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-            <div>
-              <div style="font-weight:900;color:var(--brand-800);font-size:16px;">Neon sponsored</div>
-              <div class="small-muted" style="margin-top:6px;line-height:1.55;">
-                <b>This project is proudly supported by Neon.</b><br/>
-                Neon provides the serverless Postgres infrastructure that powers NephroCompass, enabling secure, scalable,
-                and developer-friendly healthcare analytics.
-              </div>
-              <div style="margin-top:10px;">
-                👉 <a href="https://console.neon.tech/app/?promo=nephro-compass" target="_blank" rel="noopener">
-                https://console.neon.tech/app/?promo=nephro-compass</a>
+        # -------------------------
+        # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
+        # -------------------------
+        st.markdown("---")
+        st.markdown(
+            """
+            <div class="card">
+              <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+                <div>
+                  <div style="font-weight:900;color:var(--brand-800);font-size:16px;">Neon sponsored</div>
+                  <div class="small-muted" style="margin-top:6px;line-height:1.55;">
+                    <b>This project is proudly supported by Neon.</b><br/>
+                    Neon provides the serverless Postgres infrastructure that powers NephroCompass, enabling secure, scalable,
+                    and developer-friendly healthcare analytics.
+                  </div>
+                  <div style="margin-top:10px;">
+                    👉 <a href="https://console.neon.tech/app/?promo=nephro-compass" target="_blank" rel="noopener">
+                    https://console.neon.tech/app/?promo=nephro-compass</a>
+                  </div>
+                </div>
+                <div class="badge is-brand">Powered by Neon</div>
               </div>
             </div>
-            <div class="badge is-brand">Powered by Neon</div>
-          </div>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+            """,
+            unsafe_allow_html=True
+        )
+
 
 # =========================
 # Bulk predictions
