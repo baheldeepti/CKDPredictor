@@ -25,8 +25,6 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from typing import Dict, Any, List, Tuple
-from api.metrics import router as metrics_router
-app.include_router(metrics_router)
 
 
 # =========================
