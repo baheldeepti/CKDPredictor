@@ -25,6 +25,9 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 from typing import Dict, Any, List, Tuple
+from api.metrics import router as metrics_router
+app.include_router(metrics_router)
+
 
 # =========================
 # Branding & Config
@@ -968,25 +971,30 @@ with tab_single:
     st.markdown("""
     ## Kidney health check
 
-    This tool helps you understand whether your **recent lab results**
-    resemble patterns that often benefit from **kidney follow-up care**.
+    This check compares your **recent lab values** with patterns seen in people
+    who sometimes benefit from **kidney follow-up care**.
 
-    It is a **screening tool**, not a diagnosis.
+    This is a **screening tool**, not a diagnosis.
     """)
 
+    st.info(
+        "Think of this like a **weather forecast for kidney health** — it estimates risk trends, "
+        "not certainties."
+    )
+
     # -------------------------
-    # Patient-friendly input explanations
+    # Patient-friendly help text
     # -------------------------
     INPUT_HELP = {
-        "age": "Kidney function naturally changes with age.",
-        "systolicbp": "Top blood pressure number. Higher values increase kidney strain.",
+        "age": "Kidney function slowly changes as we age.",
+        "systolicbp": "Top blood pressure number. High values strain kidneys.",
         "diastolicbp": "Bottom blood pressure number.",
-        "serumcreatinine": "A waste product in blood. Higher levels may indicate reduced kidney filtering.",
-        "bunlevels": "Blood urea nitrogen (BUN). Can rise with dehydration or kidney stress.",
-        "gfr": "Estimated kidney filtering rate. Higher values generally indicate better kidney function.",
-        "acr": "Protein in urine. Higher levels may signal kidney damage.",
-        "serumelectrolytespotassium": "Potassium level. Very high levels can affect the heart.",
-        "hemoglobinlevels": "Measures red blood cells. Low levels are common in kidney disease.",
+        "serumcreatinine": "Waste filtered by kidneys. Higher values may mean reduced filtering.",
+        "bunlevels": "Blood urea nitrogen. Can rise with dehydration or kidney stress.",
+        "gfr": "Estimated kidney filtering rate. Higher is generally better.",
+        "acr": "Protein leakage in urine. Higher numbers suggest kidney damage.",
+        "serumelectrolytespotassium": "Potassium level. Very high levels may affect heart rhythm.",
+        "hemoglobinlevels": "Red blood cell level. Low levels are common in kidney disease.",
     }
 
     # -------------------------
@@ -1005,17 +1013,16 @@ with tab_single:
         with col2:
             gfr = st.number_input("GFR", 1.0, 200.0, 55.0, help=INPUT_HELP["gfr"])
             acr = st.number_input("Urine protein (ACR)", 0.0, 5000.0, 120.0, help=INPUT_HELP["acr"])
-            potassium = st.number_input("Potassium", 2.0, 7.5, 4.8, help=INPUT_HELP["serumelectrolytespotassium"])
-            hemoglobin = st.number_input("Hemoglobin", 5.0, 20.0, 12.5, help=INPUT_HELP["hemoglobinlevels"])
+            potassium = st.number_input("Potassium (mEq/L)", 2.0, 7.5, 4.8, help=INPUT_HELP["serumelectrolytespotassium"])
+            hemoglobin = st.number_input("Hemoglobin (g/dL)", 5.0, 20.0, 12.5, help=INPUT_HELP["hemoglobinlevels"])
 
         submitted = st.form_submit_button("Check kidney health")
 
     # -------------------------
-    # PREDICTION
+    # RESULT
     # -------------------------
     if submitted:
-
-        with st.spinner("Analyzing your results…"):
+        with st.spinner("Reviewing your results…"):
             payload = sanitize_payload({
                 "age": age,
                 "systolicbp": systolicbp,
@@ -1027,130 +1034,125 @@ with tab_single:
                 "serumelectrolytespotassium": potassium,
                 "hemoglobinlevels": hemoglobin,
             })
+            res = _api_post(f"{st.session_state['api_url']}/predict", json_body=payload, timeout=20)
 
-            res = _api_post(
-                f"{st.session_state['api_url']}/predict",
-                json_body=payload,
-                timeout=20
-            )
-
-        prob = float(res.get("prob_ckd", 0))
+        prob = float(res.get("prob_ckd", 0.0))
         thr = float(res.get("threshold_used", 0.5))
-        drivers = res.get("top_drivers", []) or []
-
         follow_up = prob >= thr
 
         # -------------------------
-        # RESULT (PATIENT SAFE)
+        # PATIENT RESULT CARD
         # -------------------------
-        st.markdown("### Result")
+        st.markdown("### Your result")
+
+        st.markdown(
+            f"""
+            <div class="card">
+              <b>Estimated kidney follow-up likelihood</b>
+              <div style="font-size:28px;font-weight:900;margin:8px 0;">
+                {prob:.0%}
+              </div>
+              <div class="small-muted">
+                Most people are advised follow-up when this number is above <b>{thr:.0%}</b>.
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
         if follow_up:
-            st.success("**Follow-up may be helpful**")
-            st.write(
-                "Your results look similar to patterns where clinicians often recommend "
-                "additional monitoring or discussion."
+            st.warning(
+                "This result suggests **follow-up may be helpful**. "
+                "It does not mean you have kidney disease."
             )
         else:
-            st.info("**No urgent concerns identified**")
-            st.write(
-                "Your results are more similar to patterns that usually do not require urgent follow-up."
+            st.success(
+                "This result suggests **no urgent kidney concerns** based on current patterns."
             )
 
-        st.caption("This result supports awareness and planning, not diagnosis.")
+        st.caption("This tool supports awareness and conversations with your care team.")
 
         # -------------------------
-        # WHY THIS RESULT (ALWAYS EXPLAINS)
+        # WHY (SIMPLE EXPLANATION)
         # -------------------------
-        st.markdown("### Why did the model think this?")
+        st.markdown("### What influenced this result")
 
+        drivers = res.get("top_drivers", []) or []
         df = pd.DataFrame(drivers)
         df = df[~df["feature"].isin(["age", "gender"])]
 
         if not df.empty:
             df["impact"] = df["signed"].abs()
-            df = df.sort_values("impact", ascending=False).head(6)
+            df = df.sort_values("impact", ascending=False).head(5)
 
-            fig = px.bar(
-                df,
-                y="feature",
-                x="impact",
-                orientation="h",
-                labels={
-                    "impact": "How much this influenced the result",
-                    "feature": "Health factor"
-                }
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("**In simple terms:**")
             for _, r in df.iterrows():
-                effect = "raised concern slightly" if r["signed"] > 0 else "lowered concern"
-                st.write(f"- **{pretty_feature_name(r['feature'])}** {effect}")
+                direction = "raised concern" if r["signed"] > 0 else "lowered concern"
+                st.write(f"- **{pretty_feature_name(r['feature'])}** {direction}")
+
         else:
-            st.write(
-                "This result reflects **multiple small factors working together**, "
-                "rather than one single lab value."
-            )
+            st.write("Your result comes from **several small factors combined**.")
 
         # -------------------------
-        # AI NEXT STEPS (STREAMLIT SAFE)
+        # AI NEXT STEPS (FIXED)
         # -------------------------
         st.markdown("### What you can do next")
 
-        ai_box = st.container()
-        if "ai_next_steps" not in st.session_state:
-            st.session_state.ai_next_steps = None
-
-        if st.button("Explain this in plain language"):
-            with st.spinner("Preparing guidance…"):
-                st.session_state.ai_next_steps = call_llm(
-                    system_prompt="""
-                    You explain kidney health results to patients.
-                    Calm tone. Reassuring. No diagnosis or medication advice.
-                    """,
+        if st.button("Explain this in plain language", key="btn_explain_plain"):
+            with st.spinner("Preparing a clear explanation…"):
+                st.session_state["ai_next_steps"] = call_llm(
+                    system_prompt=(
+                        "Explain kidney screening results to a patient. "
+                        "Friendly, calm tone. No diagnosis. No medication advice."
+                    ),
                     user_prompt=f"""
-                    Result summary:
-                    Follow-up suggested: {follow_up}
+                    Screening result:
+                    Probability: {prob:.2f}
+                    Threshold: {thr:.2f}
 
                     Explain:
-                    - What this result means
-                    - Why monitoring can help
+                    - What this number means
+                    - What is considered normal vs concerning
                     - 5 gentle next steps
-                    - When to seek urgent care
+                    - When to seek urgent help
                     """
                 )
 
-        with ai_box:
-            if st.session_state.ai_next_steps:
-                st.markdown(
-                    f"""
-                    <div class="card">
-                      <b>Plain-language explanation</b><br><br>
-                      {nl2br(st.session_state.ai_next_steps)}
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
+        if st.session_state.get("ai_next_steps"):
+            st.markdown(
+                f"""
+                <div class="card">
+                  <b>Plain-language guidance</b><br><br>
+                  {nl2br(st.session_state["ai_next_steps"])}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
         # -------------------------
-        # CONFUSION MATRIX (NOT OPTIONAL)
+        # RELIABILITY (PATIENT FRIENDLY)
         # -------------------------
         with st.expander("How reliable is this tool?"):
-            cm = _api_get(
-                f"{st.session_state['api_url']}/metrics/confusion_matrix",
-                timeout=10
-            )
-            if cm:
-                st.markdown(
-                    """
-                    This summary shows how often the model was correct during testing.
-                    It helps clinicians understand strengths and limitations.
-                    """
+            metrics = _api_get(f"{st.session_state['api_url']}/metrics/confusion_matrix", timeout=10)
+
+            if metrics:
+                st.write(
+                    "This tool was tested on thousands of historical records. "
+                    "Here’s how it performed during testing:"
                 )
-                st.json(cm)
+                for model, m in metrics.items():
+                    st.markdown(f"**{model.upper()} model**")
+                    cm = m["confusion_matrix"]
+                    st.write(
+                        f"- Correctly reassured: {cm['true_negative']}\n"
+                        f"- Correctly flagged: {cm['true_positive']}\n"
+                        f"- Missed cases: {cm['false_negative']}\n"
+                        f"- Over-cautious flags: {cm['false_positive']}"
+                    )
             else:
-                st.write("Performance data currently unavailable.")
+                st.write("Reliability data is currently unavailable.")
+
+        st.caption("Educational tool only. Not medical advice.")
+
         # -------------------------
         # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
         # -------------------------
