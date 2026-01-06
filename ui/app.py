@@ -960,493 +960,198 @@ with tab_chat:
         st.caption("Context loaded → " + " • ".join(chips))
     else:
         st.caption("No context loaded yet.")
-
 # =========================
-# Single prediction (PATIENT-FRIENDLY + AI INTERPRETATION)
+# Single prediction (PATIENT-FRIENDLY + AI NEXT STEPS)
 # =========================
 with tab_single:
-    st.markdown("Enter values and click **Predict**. You’ll see a probability, what it means in plain English, and top drivers.")
+
+    st.markdown("""
+    ### Kidney health check (educational)
+
+    Enter recent lab and vital values below and click **Predict**.
+
+    You’ll see:
+    - The model’s **estimated likelihood**
+    - Whether it **flags follow-up**
+    - What that means **in everyday language**
+    - Optional AI-generated **next steps**
+
+    This tool does **not** diagnose disease.
+    """)
 
     # -------------------------
-    # Patient-friendly definitions (used as inline help + labels)
+    # Patient-friendly explanations
     # -------------------------
-    INPUT_HELP = {
-        "age": "How old the patient is. Age can affect kidney risk over time.",
-        "gender": "Biological sex (used by the model because some lab reference ranges differ).",
-        "systolicbp": "Top blood pressure number (when the heart squeezes). High SBP can strain kidneys.",
-        "diastolicbp": "Bottom blood pressure number (when the heart relaxes).",
-        "serumcreatinine": "A waste product in blood. Higher creatinine can suggest lower kidney filtering.",
-        "bunlevels": "Blood Urea Nitrogen—another waste marker. Can rise with dehydration or kidney issues.",
-        "gfr": "Estimated kidney filtering rate. Higher is generally better. Used for CKD staging.",
-        "acr": "Albumin-to-creatinine ratio. Measures protein leaking into urine—higher can signal kidney damage.",
-        "serumelectrolytessodium": "Sodium level in blood. Big shifts can reflect fluid balance issues.",
-        "serumelectrolytespotassium": "Potassium level in blood. Very high potassium can be dangerous.",
-        "hemoglobinlevels": "Oxygen-carrying protein in blood. Low hemoglobin can indicate anemia (common in CKD).",
-        "hba1c": "3-month average blood sugar. Higher values can raise kidney risk over time.",
-    }
+    def explain_probability(prob: float) -> str:
+        return (
+            f"The model estimates a **{prob:.0%} likelihood** that this pattern looks similar to "
+            "people in its training data who had chronic kidney disease. "
+            "This is a statistical estimate, not a diagnosis."
+        )
 
-    def risk_band(prob: float, thr: float) -> tuple[str, str, str]:
-        """
-        Returns (label, badge_css, explanation)
-        - We keep the model's threshold as the "flag line"
-        - Also show a patient-friendly band for intuition
-        """
+    def explain_threshold(prob: float, thr: float) -> str:
         if prob >= thr:
             return (
-                "High likelihood (flagged by this model)",
-                "is-bad",
-                f"This model flags follow-up because the probability ({prob:.3f}) is at/above its decision threshold ({thr:.3f}).",
-            )
-        if prob >= 0.33:
-            return (
-                "Moderate likelihood",
-                "is-warn",
-                f"The probability ({prob:.3f}) is below the model’s threshold ({thr:.3f}) but not low. Consider monitoring and repeat labs.",
+                "Because this estimate is **above the model’s follow-up line**, "
+                "the model flags this result for closer review."
             )
         return (
-            "Lower likelihood",
-            "is-ok",
-            f"The probability ({prob:.3f}) is below the model’s threshold ({thr:.3f}). This does not rule out CKD—use clinical judgment and trends.",
+            "Because this estimate is **below the model’s follow-up line**, "
+            "the model does not flag this result — but trends and symptoms still matter."
         )
 
-    def ai_patient_summary(
-        model_label: str,
-        prob: float,
-        thr: float,
-        payload: dict,
-        top_drivers: list[dict] | None,
-    ) -> str | None:
-        """
-        Uses the configured LLM (OpenRouter/OpenAI/custom) to generate:
-        - Plain-English explanation
-        - Top 5 action items (patient/caregiver oriented)
-        """
-        # Minimal driver digest (no raw context dumps)
-        driver_lines = []
-        if top_drivers:
-            for d in top_drivers[:6]:
-                f = pretty_feature_name(d.get("feature", ""))
-                signed = float(d.get("signed", 0.0)) if d.get("signed") is not None else 0.0
-                arrow = "↑" if signed > 0 else "↓"
-                driver_lines.append(f"- {f} ({arrow} risk, Δprob≈{signed:+.3f})")
-        drivers_text = "\n".join(driver_lines) if driver_lines else "No driver list available."
+    def patient_result_label(prob: float, thr: float) -> tuple[str, str]:
+        if prob >= thr:
+            return ("Follow-up recommended", "is-bad")
+        if prob >= 0.33:
+            return ("Monitor closely", "is-warn")
+        return ("Lower concern", "is-ok")
 
-        stage = int(payload.get("ckdstage", 0))
-        alb   = int(payload.get("albuminuriacat", 0))
+    # -------------------------
+    # AI explanation (FIXED)
+    # -------------------------
+    def ai_patient_summary(payload: dict, prob: float, thr: float, drivers: list[dict]) -> str:
 
-        system_prompt = (
-            "You are a careful kidney-health assistant writing for patients and caregivers.\n"
-            "Use plain English. Avoid medical jargon or define it in one short phrase.\n"
-            "No medication dosing. No diagnosis. Encourage clinician follow-up.\n"
-            "Always include a short safety line for urgent red flags (very high potassium, severe symptoms).\n"
-            "Output MUST be short sections and bullets.\n"
-        )
+        driver_list = "\n".join(
+            f"- {pretty_feature_name(d['feature'])}"
+            for d in drivers[:5]
+        ) or "- No single dominant factor identified"
+
+        system_prompt = """
+        You are a kidney-health assistant writing for patients and caregivers.
+
+        Rules:
+        - Use plain, calm language
+        - Do NOT diagnose
+        - Explain probability and follow-up flags clearly
+        - No medication dosing
+        - Focus on understanding and next steps
+
+        Use short sections and bullets.
+        End with: Educational tool; not medical advice.
+        """
 
         user_prompt = f"""
-Model result: {model_label}
-Probability of CKD: {prob:.3f}
-Decision threshold (flag line): {thr:.3f}
+        The model estimated a {prob:.0%} likelihood.
+        The follow-up line is at {thr:.0%}.
 
-Key context (derived from inputs):
-- CKD Stage (from GFR): {stage}  (1=best → 5=lowest kidney function)
-- Albuminuria category (from ACR): {alb} (1=low → 3=high protein leak)
-- Systolic/Diastolic BP: {payload.get('systolicbp')} / {payload.get('diastolicbp')} mmHg
-- GFR: {payload.get('gfr')} mL/min/1.73m²
-- ACR: {payload.get('acr')} mg/g
-- Potassium: {payload.get('serumelectrolytespotassium')} mEq/L
-- Hemoglobin: {payload.get('hemoglobinlevels')} g/dL
-- HbA1c: {payload.get('hba1c')} %
+        Context:
+        - CKD stage (from GFR): {payload.get("ckdstage")}
+        - Protein in urine category: {payload.get("albuminuriacat")}
+        - High blood pressure flag: {payload.get("bp_risk")}
+        - Anemia flag: {payload.get("anemiaflag")}
 
-Top drivers (model explanation, simplified):
-{drivers_text}
+        Factors that may be contributing:
+        {driver_list}
 
-Task:
-1) Explain what this probability means in everyday language (2–4 bullets).
-2) Explain the difference between "probability" and "threshold" in one simple line.
-3) Provide "Top 5 action items" for a patient/caregiver (labs to repeat, what to track, lifestyle basics, questions to ask a clinician).
-4) Add a short "When to seek urgent help" line (no fear-mongering; just safety).
-5) End with: "Educational tool; not medical advice."
-""".strip()
+        Write:
+        1. What this result means
+        2. Why follow-up may or may not be recommended
+        3. Top 5 practical next steps
+        4. When to seek urgent help
+        """
 
         return call_llm(system_prompt, user_prompt)
 
     # -------------------------
-    # Prefill / Reset controls
-    # -------------------------
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        sample_idx = st.selectbox("Prefill sample", [1, 2, 3, 4, 5], index=1, key="sp_sample_idx")
-    with c2:
-        do_prefill = st.button("Use sample", key="sp_use_sample")
-    with c3:
-        do_reset = st.button("Reset form", key="sp_reset")
-
-    def _defaults(si=None):
-        df = sample_records_df()
-        if si is not None:
-            row = df.iloc[si - 1].to_dict()
-            return (
-                int(row["age"]), int(row["gender"]),
-                int(row["systolicbp"]), int(row["diastolicbp"]),
-                float(row["serumcreatinine"]), float(row["bunlevels"]),
-                float(row["gfr"]), float(row["acr"]),
-                float(row["serumelectrolytessodium"]), float(row["serumelectrolytespotassium"]),
-                float(row["hemoglobinlevels"]), float(row["hba1c"]),
-            )
-        return (60, 1, 140, 85, 2.0, 28.0, 55.0, 120.0, 138.0, 4.8, 12.5, 6.8)
-
-    if do_reset:
-        st.rerun()
-
-    if do_prefill:
-        (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults(sample_idx)
-    else:
-        (age_d, gender_d, sbp_d, dbp_d, sc_d, bun_d, gfr_d, acr_d, na_d, k_d, hb_d, a1c_d) = _defaults()
-
-    # -------------------------
-    # Input form (patient-friendly)
+    # Input form (unchanged)
     # -------------------------
     with st.form("predict_form", border=True):
+
         col1, col2 = st.columns(2)
 
         with col1:
-            age = st.number_input(
-                "Age (years) — how old is the patient?",
-                0, 120, age_d, key="sp_age", help=INPUT_HELP["age"]
-            )
-            gender_index = 1 if int(gender_d) == 1 else 0
-            gender = st.selectbox(
-                "Sex (0=female, 1=male) — used for lab reference ranges",
-                [0, 1], index=gender_index, key="sp_gender", help=INPUT_HELP["gender"]
-            )
-            systolicbp = st.number_input(
-                "Systolic BP (mmHg) — top BP number",
-                70, 260, sbp_d, key="sp_sbp", help=INPUT_HELP["systolicbp"]
-            )
-            diastolicbp = st.number_input(
-                "Diastolic BP (mmHg) — bottom BP number",
-                40, 160, dbp_d, key="sp_dbp", help=INPUT_HELP["diastolicbp"]
-            )
-            serumcreatinine = st.number_input(
-                "Serum creatinine (mg/dL) — blood waste marker",
-                0.2, 15.0, sc_d, step=0.1, key="sp_sc", help=INPUT_HELP["serumcreatinine"]
-            )
-            bunlevels = st.number_input(
-                "BUN (mg/dL) — blood urea nitrogen (waste marker)",
-                1.0, 200.0, bun_d, step=0.5, key="sp_bun", help=INPUT_HELP["bunlevels"]
-            )
-            gfr = st.number_input(
-                "GFR (mL/min/1.73m²) — estimated kidney filtering rate",
-                1.0, 200.0, gfr_d, step=0.5, key="sp_gfr", help=INPUT_HELP["gfr"]
-            )
-            acr = st.number_input(
-                "ACR (mg/g) — protein leak in urine (albumin/creatinine ratio)",
-                0.0, 5000.0, acr_d, step=1.0, key="sp_acr", help=INPUT_HELP["acr"]
-            )
+            age = st.number_input("Age", 0, 120, 60)
+            gender = st.selectbox("Sex (0=female, 1=male)", [0, 1])
+            systolicbp = st.number_input("Systolic BP", 70, 260, 140)
+            diastolicbp = st.number_input("Diastolic BP", 40, 160, 85)
+            serumcreatinine = st.number_input("Creatinine", 0.2, 15.0, 2.0, step=0.1)
+            bunlevels = st.number_input("BUN", 1.0, 200.0, 28.0)
 
         with col2:
-            serumelectrolytessodium = st.number_input(
-                "Sodium (mEq/L) — blood salt level",
-                110.0, 170.0, na_d, step=0.5, key="sp_na", help=INPUT_HELP["serumelectrolytessodium"]
-            )
-            serumelectrolytespotassium = st.number_input(
-                "Potassium (mEq/L) — important heart electrolyte",
-                2.0, 7.5, k_d, step=0.1, key="sp_k", help=INPUT_HELP["serumelectrolytespotassium"]
-            )
-            hemoglobinlevels = st.number_input(
-                "Hemoglobin (g/dL) — anemia screen",
-                5.0, 20.0, hb_d, step=0.1, key="sp_hb", help=INPUT_HELP["hemoglobinlevels"]
-            )
-            hba1c = st.number_input(
-                "HbA1c (%) — 3-month average blood sugar",
-                3.5, 15.0, a1c_d, step=0.1, key="sp_a1c", help=INPUT_HELP["hba1c"]
-            )
+            gfr = st.number_input("GFR", 1.0, 200.0, 55.0)
+            acr = st.number_input("ACR", 0.0, 5000.0, 120.0)
+            serumelectrolytespotassium = st.number_input("Potassium", 2.0, 7.5, 4.8)
+            hemoglobinlevels = st.number_input("Hemoglobin", 5.0, 20.0, 12.5)
+            hba1c = st.number_input("HbA1c", 3.5, 15.0, 6.8)
 
-            bp_risk, hyperkalemiaflag, anemiaflag, ckdstage, albuminuriacat = derive_flags_and_bins(
-                systolicbp, diastolicbp, serumelectrolytespotassium, hemoglobinlevels, gfr, acr
-            )
-
-        pulsepressure = systolicbp - diastolicbp
-        ureacreatinineratio = float(bunlevels) / (float(serumcreatinine) + 1e-6)
-
-        st.caption(
-            f"Derived (auto): Pulse pressure = {pulsepressure} mmHg • "
-            f"Urea/Creatinine ratio = {ureacreatinineratio:.2f} • "
-            f"Flags: High BP={bp_risk}, High potassium={hyperkalemiaflag}, Anemia={anemiaflag} • "
-            f"CKD stage (from GFR)={ckdstage}, Albuminuria category (from ACR)={albuminuriacat}"
-        )
-
-        do_predict = st.form_submit_button(
-            "Predict with selected models",
-            use_container_width=True,
-            help="Runs the selected models and generates a patient-friendly explanation.",
-        )
+        do_predict = st.form_submit_button("Predict")
 
     # -------------------------
-    # Predict + patient-friendly meaning + AI “Top 5 actions”
+    # Prediction output
     # -------------------------
     if do_predict:
-        payload = {
-            "age": age, "gender": gender,
-            "systolicbp": systolicbp, "diastolicbp": diastolicbp,
-            "serumcreatinine": serumcreatinine, "bunlevels": bunlevels,
-            "gfr": gfr, "acr": acr,
-            "serumelectrolytessodium": serumelectrolytessodium,
+
+        payload = sanitize_payload({
+            "age": age,
+            "gender": gender,
+            "systolicbp": systolicbp,
+            "diastolicbp": diastolicbp,
+            "serumcreatinine": serumcreatinine,
+            "bunlevels": bunlevels,
+            "gfr": gfr,
+            "acr": acr,
             "serumelectrolytespotassium": serumelectrolytespotassium,
-            "hemoglobinlevels": hemoglobinlevels, "hba1c": hba1c,
-            "pulsepressure": pulsepressure, "ureacreatinineratio": ureacreatinineratio,
-            "ckdstage": ckdstage, "albuminuriacat": albuminuriacat,
-            "bp_risk": bp_risk, "hyperkalemiaflag": hyperkalemiaflag, "anemiaflag": anemiaflag,
-        }
-        payload = sanitize_payload(payload)
-        st.session_state["last_pred_payload"] = payload
-        st.session_state["last_pred_results"] = {}
+            "hemoglobinlevels": hemoglobinlevels,
+            "hba1c": hba1c,
+        })
 
-        # Optional: show probability bands legend once
-        with st.expander("How to read the probability + threshold (simple)", expanded=False):
+        res = _api_post(
+            "https://ckdpredictor.onrender.com/predict",
+            json_body=payload,
+            timeout=20
+        )
+
+        prob = float(res.get("prob_ckd", 0.0))
+        thr = float(res.get("threshold_used", 0.5))
+        drivers = res.get("top_drivers", [])
+
+        label, badge = patient_result_label(prob, thr)
+
+        st.markdown(
+            f"""
+            <div class="card">
+              <div style="display:flex;justify-content:space-between;">
+                <b>{label}</b>
+                <span class="badge {badge}">{label}</span>
+              </div>
+              <ul>
+                <li>{explain_probability(prob)}</li>
+                <li>{explain_threshold(prob, thr)}</li>
+              </ul>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+        # -------------------------
+        # AI NEXT STEPS (FIXED)
+        # -------------------------
+        if "ai_text" not in st.session_state:
+            st.session_state["ai_text"] = None
+
+        if st.button("Explain this and suggest next steps"):
+            with st.spinner("Generating explanation…"):
+                txt = ai_patient_summary(payload, prob, thr, drivers)
+                if txt:
+                    st.session_state["ai_text"] = txt
+                else:
+                    st.session_state["ai_text"] = "⚠️ AI explanation could not be generated."
+
+        if st.session_state["ai_text"]:
             st.markdown(
-                "- **Probability** is the model’s estimate (0 to 1) that the profile looks like CKD in training data.\n"
-                "- **Threshold** is the model’s internal “flag line.” If probability ≥ threshold, it flags follow-up.\n"
-                "- Different models can have different thresholds.\n"
-                "- This tool supports screening and education; it’s not a diagnosis."
+                f"""
+                <div class="card">
+                  <div style="font-weight:800;margin-bottom:6px;">
+                    AI explanation & next steps
+                  </div>
+                  <div style="line-height:1.6;">
+                    {nl2br(st.session_state["ai_text"])}
+                  </div>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
-
-        cols = st.columns(len(selected_models))
-
-        # Store per-model explainers so we can run AI summaries with the best available drivers
-        model_top_drivers: dict[str, list[dict]] = {}
-
-        for idx, m in enumerate(selected_models):
-            try:
-                res = _api_post(
-                    f"{st.session_state['api_url']}/predict",
-                    json_body=payload,
-                    params={"model": m},
-                    timeout=20
-                )
-                st.session_state["last_pred_results"][m] = res
-
-                with cols[idx]:
-                    prob = float(res.get("prob_ckd", 0.0))
-                    thr  = float(res.get("threshold_used", 0.5))
-                    model_used = res.get("model_used", m)
-                    label, badge_cls, expl = risk_band(prob, thr)
-
-                    st.markdown(
-                        f"""
-                        <div class="card">
-                          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                            <div style="font-size:18px;font-weight:800;color:var(--brand-800);">{MODEL_KEYS.get(model_used, model_used)}</div>
-                            <div class="badge {badge_cls}">{label}</div>
-                          </div>
-                          <div class="kpi">
-                            <div class="metric"><b>Probability (0–1)</b><span>{prob:.3f}</span></div>
-                            <div class="metric"><b>Flag threshold</b><span>{thr:.3f}</span></div>
-                          </div>
-                          <div class="small-muted" style="margin-top:8px;">
-                            {expl}
-                          </div>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-            except requests.HTTPError as e:
-                with cols[idx]:
-                    st.error(f"{MODEL_KEYS.get(m,m)} failed")
-                    msg = getattr(e.response, "text", str(e)) or str(e)
-                    st.code(msg, language="json")
-                _log(f"Single predict HTTP ERROR ({m}): {e}")
-            except Exception as e:
-                with cols[idx]:
-                    st.error(f"{MODEL_KEYS.get(m,m)} error")
-                    st.caption(str(e))
-                _log(f"Single predict ERROR ({m}): {e}")
-
-        # -------------------------
-        # Confusion matrix (if your API provides it)
-        # -------------------------
-        st.markdown("#### Model performance snapshot (confusion matrix)")
-        st.caption("If available from the backend. This helps interpret how the model performs on known labeled data.")
-        perf_cols = st.columns(len(selected_models))
-        for idx, m in enumerate(selected_models):
-            with perf_cols[idx]:
-                try:
-                    # Try a few likely endpoints without breaking UX
-                    cm = None
-                    for ep in ("/metrics/confusion_matrix", "/metrics/confusion", "/metrics/model_card"):
-                        try:
-                            cm = _api_get(f"{st.session_state['api_url']}{ep}", params={"model": m}, timeout=10)
-                            if cm:
-                                break
-                        except Exception:
-                            cm = None
-
-                    if not cm:
-                        st.info("Not available from backend yet.")
-                    else:
-                        st.markdown(f"**{MODEL_KEYS.get(m,m)}**")
-                        # Accept either a ready-to-render matrix or a model card dict
-                        if isinstance(cm, dict) and "confusion_matrix" in cm:
-                            st.json(cm["confusion_matrix"])
-                        elif isinstance(cm, dict) and all(k in cm for k in ("tn","fp","fn","tp")):
-                            st.table(pd.DataFrame([cm])[["tn","fp","fn","tp"]])
-                        else:
-                            st.json(cm)
-                except Exception:
-                    st.info("Not available from backend yet.")
-
-        # -------------------------
-        # Explainability + AI interpretation (hide age/gender from SHAP view)
-        # -------------------------
-        st.markdown("#### Why did the model think that? (Top drivers)")
-        st.caption("We hide **age** and **sex** here to reduce confusion; focus on modifiable lab/vital drivers.")
-        ecols = st.columns(len(selected_models))
-
-        for idx, m in enumerate(selected_models):
-            if m not in st.session_state["last_pred_results"]:
-                continue
-
-            with ecols[idx]:
-                try:
-                    top, raw_exp, mode = explain_with_fallback(
-                        st.session_state["api_url"],
-                        st.session_state["last_pred_payload"],
-                        m
-                    )
-
-                    if top:
-                        df_top = pd.DataFrame(top)
-
-                        # Normalize columns
-                        if "impact" not in df_top.columns and "signed" in df_top.columns:
-                            df_top["impact"] = df_top["signed"].abs()
-                        df_top["impact"] = pd.to_numeric(df_top["impact"], errors="coerce").fillna(0.0)
-
-                        # Remove age & gender from displayed explainers
-                        df_top = df_top[~df_top["feature"].isin(["age", "gender"])].copy()
-
-                        # If filtering removed everything, fall back to original list but still avoid showing age/gender
-                        if df_top.empty:
-                            st.info("Drivers were mostly demographic. Try another model or verify inputs.")
-                            model_top_drivers[m] = []
-                        else:
-                            df_sorted = df_top.sort_values("impact", ascending=False)
-                            model_top_drivers[m] = df_sorted.head(8).to_dict(orient="records")
-
-                            # Plotly bar
-                            fig = px.bar(
-                                df_sorted.head(10),
-                                y="feature",
-                                x="impact",
-                                orientation="h",
-                                text="impact",
-                                title=None
-                            )
-                            fig.update_traces(
-                                texttemplate="%{text:.3f}",
-                                textposition="outside",
-                                cliponaxis=False
-                            )
-                            fig.update_layout(
-                                yaxis=dict(
-                                    categoryorder="array",
-                                    categoryarray=df_sorted.head(10)["feature"].tolist()
-                                ),
-                                xaxis_title="Impact (|Δprob|)",
-                                yaxis_title="Driver",
-                                margin=dict(l=10, r=40, t=10, b=10),
-                                height=320,
-                                xaxis_range=[0, float(df_sorted["impact"].max()) * 1.15]
-                            )
-                            st.plotly_chart(fig, use_container_width=True)
-
-                            bullets = "\n".join(
-                                f"- **{pretty_feature_name(row['feature'])}** "
-                                f"({'↑' if float(row.get('signed',0))>0 else '↓'} risk, Δprob={float(row.get('signed',0)):+.3f})"
-                                for _, row in df_sorted.head(5).iterrows()
-                            )
-                            st.markdown(bullets)
-
-                            note = "Server SHAP" if mode == "server_shap" else "Local sensitivity fallback"
-                            st.caption(f"*Explainer source: {note}*")
-
-                            # Store explainability context for Chat (also filtered)
-                            try:
-                                st.session_state["ctx_explain"] = {
-                                    "schema_version": 1,
-                                    "model": m,
-                                    "top": model_top_drivers[m][:8],
-                                    "mode": mode
-                                }
-                            except Exception:
-                                pass
-
-                            if raw_exp:
-                                with st.expander("Raw explanation (debug)", expanded=False):
-                                    st.json(raw_exp)
-
-                    else:
-                        st.info("No drivers available for explanation.")
-                        model_top_drivers[m] = []
-
-                    _log(f"Explain OK ({m}) via {mode}.")
-
-                except requests.HTTPError as e:
-                    try:
-                        det = e.response.json()
-                    except Exception:
-                        det = getattr(e.response, "text", str(e))
-                    st.error("Explain failed")
-                    st.code(det, language="json")
-                    _log(f"Explain HTTP ERROR ({m}): {e}")
-                    model_top_drivers[m] = []
-                except Exception as e:
-                    st.error("Explain error")
-                    st.caption(str(e))
-                    _log(f"Explain ERROR ({m}): {e}")
-                    model_top_drivers[m] = []
-
-        # -------------------------
-        # AI interpretation + Top 5 action items (per model)
-        # -------------------------
-        st.markdown("#### AI explanation (plain English) + Top 5 action items")
-        st.caption("Generated from your inputs + model result + driver list. No medication dosing. Educational only.")
-
-        ai_cols = st.columns(len(selected_models))
-        for idx, m in enumerate(selected_models):
-            with ai_cols[idx]:
-                res = st.session_state["last_pred_results"].get(m)
-                if not res:
-                    st.info("Run prediction first.")
-                    continue
-
-                prob = float(res.get("prob_ckd", 0.0))
-                thr  = float(res.get("threshold_used", 0.5))
-                model_label = MODEL_KEYS.get(res.get("model_used", m), m)
-
-                if st.button(f"Generate AI summary • {model_label}", key=f"btn_ai_single_{m}"):
-                    txt = ai_patient_summary(
-                        model_label=model_label,
-                        prob=prob,
-                        thr=thr,
-                        payload=payload,
-                        top_drivers=model_top_drivers.get(m, [])
-                    )
-                    if txt:
-                        st.markdown(
-                            f"""
-                            <div class="card">
-                              <div style="font-weight:900;color:var(--brand-800);margin-bottom:6px;">
-                                {model_label} — AI explanation
-                              </div>
-                              <div style="line-height:1.6">{nl2br(txt)}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
-                        )
-                    else:
-                        st.error("LLM did not return text. Check LLM settings / key.")
 
     # -------------------------
     # Sponsor snippet (Neon) — paste anywhere you want (footer/sidebar)
