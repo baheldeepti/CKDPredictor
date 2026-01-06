@@ -1,11 +1,8 @@
-# CKD AI (MVP)
+## ❤️ Acknowledgments
 
-## Quickstart
-1) Put your dataset at `data/raw/Chronic_Kidney_Dsease_data.csv`.
-2) `pip install -r requirements.txt`
-3) `cp config/.env.example .env`
-4) `make prep`  (runs ETL: validate + derive features + write parquet)
+This project is proudly supported by **Neon**.
 
-This project is proudly supported by Neon
-https://console.neon.tech/app/org-twilight-dream-72459901/projects
+Neon provides the serverless Postgres infrastructure that powers NephroCompass, enabling secure, scalable, and developer-friendly healthcare analytics.
+
+👉 https://console.neon.tech/app/?promo=nephro-compass
 
