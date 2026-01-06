@@ -1,8 +1,9 @@
+# api/metrics.py
 from pathlib import Path
 import json
 from fastapi import APIRouter, HTTPException
 
-router = APIRouter()
+router = APIRouter(prefix="/metrics", tags=["Metrics"])
 MODEL_DIR = Path("models")
 
 MODEL_META = {
@@ -11,7 +12,7 @@ MODEL_META = {
     "xgb": MODEL_DIR / "xgb_ckd_meta.json",
 }
 
-@router.get("/metrics/confusion_matrix")
+@router.get("/confusion_matrix")
 def get_confusion_matrices():
     output = {}
 
@@ -19,9 +20,7 @@ def get_confusion_matrices():
         if not path.exists():
             continue
 
-        with open(path) as f:
-            meta = json.load(f)
-
+        meta = json.loads(path.read_text())
         cm = meta.get("metrics", {}).get("test", {}).get("confusion_matrix")
         if not cm:
             continue
